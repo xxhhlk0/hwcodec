@@ -235,11 +235,22 @@ public:
       LOG_ERROR(std::string("set_lantency_free failed, name: ") + name_);
       return false;
     }
-    // util_encode::set_quality(c_->priv_data, name_, quality_);
+    // preset/quality: previously commented out, so the quality argument passed in from
+    // rustdesk (encode profile) had no effect at all. Quality_Default is a no-op, so this
+    // only changes behaviour when a non-default preset is explicitly requested.
+    if (!util_encode::set_quality(c_->priv_data, name_, quality_)) {
+      // do not fail the session, just keep the encoder default preset
+      LOG_ERROR(std::string("set_quality failed, keep the default preset, name: ") + name_);
+    }
     util_encode::set_rate_control(c_, name_, rc_, q_);
     util_encode::set_gpu(c_->priv_data, name_, gpu_);
     util_encode::force_hw(c_->priv_data, name_);
     util_encode::set_others(c_->priv_data, name_);
+    LOG_INFO("hw encode params: name=" + name_ +
+             ", quality=" + std::to_string(quality_) + ", rc=" +
+             std::to_string(rc_) + ", q=" + std::to_string(q_) +
+             ", kbs=" + std::to_string(kbs_) + ", fps=" + std::to_string(fps_) +
+             ", gop=" + std::to_string(gop_));
     if (name_.find("mediacodec") != std::string::npos) {
       if (mc_name_.length() > 0) {
         LOG_INFO(std::string("mediacodec codec_name: ") + mc_name_);

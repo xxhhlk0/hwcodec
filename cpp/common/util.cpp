@@ -107,7 +107,14 @@ bool set_quality(void *priv_data, const std::string &name, int quality) {
 
   if (name.find("nvenc") != std::string::npos) {
     switch (quality) {
-    // p7 isn't zero lantency
+    // p7 isn't zero lantency, so it is only applied when the highest quality preset is
+    // explicitly requested by the user; Quality_Default/Medium/Low are untouched.
+    case Quality_High:
+      if ((ret = av_opt_set(priv_data, "preset", "p7", 0)) < 0) {
+        LOG_ERROR(std::string("nvenc set opt preset p7 failed, ret = ") + av_err2str(ret));
+        return false;
+      }
+      break;
     case Quality_Medium:
       if ((ret = av_opt_set(priv_data, "preset", "p4", 0)) < 0) {
         LOG_ERROR(std::string("nvenc set opt preset p4 failed, ret = ") + av_err2str(ret));
@@ -208,14 +215,19 @@ bool set_rate_control(AVCodecContext *c, const std::string &name, int rc,
     // https://github.com/LizardByte/Sunshine/blob/3e47cd3cc8fd37a7a88be82444ff4f3c0022856b/src/video.cpp#L1635
     c->strict_std_compliance = FF_COMPLIANCE_UNOFFICIAL;
   }
+  // constant QP ("CQ") support: nvenc uses rc=constqp + qp, amf uses rc=cqp + qp_i/qp_p/qp_b,
+  // mediacodec uses bitrate_mode=cq + global_quality, qsv uses ICQ (global_quality).
   std::vector<CodecOptions> codecs = {
-      {"nvenc", "rc", {{RC_CBR, "cbr"}, {RC_VBR, "vbr"}}},
-      {"amf", "rc", {{RC_CBR, "cbr"}, {RC_VBR, "vbr_latency"}}},
+      {"nvenc", "rc", {{RC_CBR, "cbr"}, {RC_VBR, "vbr"}, {RC_CQ, "constqp"}}},
+      {"amf",
+       "rc",
+       {{RC_CBR, "cbr"}, {RC_VBR, "vbr_latency"}, {RC_CQ, "cqp"}}},
       {"mediacodec",
        "bitrate_mode",
        {{RC_CBR, "cbr"}, {RC_VBR, "vbr"}, {RC_CQ, "cq"}}},
       // {"videotoolbox", "constant_bit_rate", {{RC_CBR, "1"}}},
-    };
+  };
+  bool has_qp = q >= 0 && q <= 51;
 
   for (const auto &codec : codecs) {
     if (name.find(codec.codec_name) != std::string::npos) {
@@ -228,15 +240,56 @@ bool set_rate_control(AVCodecContext *c, const std::string &name, int rc,
                     it->second + " failed, ret = " + av_err2str(ret));
           return false;
         }
-        if (name.find("mediacodec") != std::string::npos) {
-          if (rc == RC_CQ) {
-            if (q >= 0 && q <= 51) {
-              c->global_quality = q;
+        if (rc == RC_CQ) {
+          if (!has_qp) {
+            LOG_INFO(codec.codec_name +
+                     " rc=CQ but q is out of range [0, 51], keep the encoder "
+                     "default QP, q = " +
+                     std::to_string(q));
+          } else if (name.find("mediacodec") != std::string::npos) {
+            c->global_quality = q;
+          } else if (name.find("nvenc") != std::string::npos) {
+            if ((ret = av_opt_set_int(c->priv_data, "qp", q, 0)) < 0) {
+              LOG_ERROR(std::string("nvenc set opt qp failed, ret = ") +
+                        av_err2str(ret));
+              return false;
+            }
+          } else if (name.find("amf") != std::string::npos) {
+            const char *qp_opts[] = {"qp_i", "qp_p", "qp_b"};
+            for (const auto *opt : qp_opts) {
+              if ((ret = av_opt_set_int(c->priv_data, opt, q, 0)) < 0) {
+                LOG_ERROR(std::string("amf set opt ") + opt +
+                          " failed, ret = " + av_err2str(ret));
+                return false;
+              }
             }
           }
         }
       }
       break;
+    }
+  }
+
+  // qsv has no "rc" AVOption: ffmpeg picks the rate control mode from the
+  // AVCodecContext fields (see qsvenc.c select_rc_mode), so handle it here.
+  if (name.find("qsv") != std::string::npos) {
+    if (rc == RC_CBR) {
+      // set_av_codec_ctx() sets rc_max_rate = bit_rate and then decrements bit_rate to
+      // make ffmpeg choose the VBR branch; making both equal selects real CBR.
+      if (c->rc_max_rate > 0) {
+        c->bit_rate = c->rc_max_rate;
+      }
+    } else if (rc == RC_CQ) {
+      // ICQ requires global_quality > 0 (see qsvenc.c select_rc_mode) and no bitrate limit.
+      if (q > 0 && q <= 51) {
+        c->rc_max_rate = 0;
+        c->bit_rate = 0;
+        c->global_quality = q;
+      } else {
+        LOG_INFO(std::string("qsv rc=CQ but q is out of range [1, 51], keep the "
+                             "default rate control, q = ") +
+                 std::to_string(q));
+      }
     }
   }
 
