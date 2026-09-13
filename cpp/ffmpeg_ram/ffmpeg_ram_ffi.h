@@ -15,8 +15,9 @@ typedef void (*RamEncodeCallback)(const uint8_t *data, int len, int64_t pts,
 void *ffmpeg_ram_new_encoder(const char *name, const char *mc_name, int width,
                              int height, int pixfmt, int align, int fps,
                              int gop, int rc, int quality, int kbs, int q,
-                             int thread_count, int gpu, int *linesize,
-                             int *offset, int *length,
+                             int spatial_aq, int temporal_aq, int multipass,
+                             int preanalysis, int thread_count, int gpu,
+                             int *linesize, int *offset, int *length,
                              RamEncodeCallback callback);
 void *ffmpeg_ram_new_decoder(const char *name, int device_type,
                              int thread_count, RamDecodeCallback callback);

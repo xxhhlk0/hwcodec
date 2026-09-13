@@ -15,6 +15,10 @@ bool set_lantency_free(void *priv_data, const std::string &name);
 bool set_quality(void *priv_data, const std::string &name, int quality);
 bool set_rate_control(AVCodecContext *c, const std::string &name, int rc,
                       int q);
+// 画质增强 (可选, 均为编码器内建能力): nvenc spatial-aq/temporal-aq/multipass,
+// amf preanalysis。返回是否应用了至少一项 (调用方据此在初始化失败时回退重试)。
+bool set_encode_enhance(void *priv_data, const std::string &name, int spatial_aq,
+                        int temporal_aq, int multipass, int preanalysis);
 bool set_gpu(void *priv_data, const std::string &name, int gpu);
 bool force_hw(void *priv_data, const std::string &name);
 bool set_others(void *priv_data, const std::string &name);

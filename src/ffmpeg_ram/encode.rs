@@ -35,6 +35,14 @@ pub struct EncodeContext {
     pub quality: Quality,
     pub kbs: i32,
     pub q: i32,
+    /// 画质增强 (编码器内建能力, 不额外占 CPU):
+    /// nvenc spatial-aq / temporal-aq / multipass, amf preanalysis。
+    /// false/0 表示不设置该选项 (由编码器默认值决定)。
+    pub spatial_aq: bool,
+    pub temporal_aq: bool,
+    /// nvenc multipass: 0=disabled 1=two pass quarter res 2=two pass full res
+    pub multipass: i32,
+    pub preanalysis: bool,
     pub thread_count: i32,
 }
 
@@ -90,6 +98,10 @@ impl Encoder {
                 ctx.quality as _,
                 ctx.kbs,
                 ctx.q,
+                ctx.spatial_aq as _,
+                ctx.temporal_aq as _,
+                ctx.multipass,
+                ctx.preanalysis as _,
                 ctx.thread_count,
                 gpu,
                 linesize.as_mut_ptr(),

@@ -30,6 +30,10 @@ fn main() {
         rc: RC_DEFAULT,
         thread_count: 4,
         q: -1,
+        spatial_aq: false,
+        temporal_aq: false,
+        multipass: 0,
+        preanalysis: false,
     };
     let decode_ctx = DecodeContext {
         name: String::from("hevc"),

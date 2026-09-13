@@ -87,6 +87,10 @@ fn decode_encode(
         rc: RC_DEFAULT,
         thread_count: 4,
         q: -1,
+        spatial_aq: false,
+        temporal_aq: false,
+        multipass: 0,
+        preanalysis: false,
     };
     let mut video_encoder = Encoder::new(enc_ctx).unwrap();
     let mut encode_file =

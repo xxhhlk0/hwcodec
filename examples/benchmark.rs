@@ -29,6 +29,10 @@ fn main() {
         rc: RC_DEFAULT,
         thread_count: 4,
         q: -1,
+        spatial_aq: false,
+        temporal_aq: false,
+        multipass: 0,
+        preanalysis: false,
     };
     let yuv_count = 10;
     println!("benchmark");

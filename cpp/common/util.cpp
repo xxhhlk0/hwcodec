@@ -295,6 +295,61 @@ bool set_rate_control(AVCodecContext *c, const std::string &name, int rc,
 
   return true;
 }
+bool set_encode_enhance(void *priv_data, const std::string &name, int spatial_aq,
+                        int temporal_aq, int multipass, int preanalysis) {
+  // 画质增强项; 失败只记日志不返回失败, 避免因为一个可选项让整条会话建不起来
+  int ret;
+  bool applied = false;
+
+  if (name.find("nvenc") != std::string::npos) {
+    if (spatial_aq > 0) {
+      if ((ret = av_opt_set_int(priv_data, "spatial-aq", 1, 0)) < 0) {
+        LOG_ERROR(std::string("nvenc set opt spatial-aq failed, ret = ") +
+                  av_err2str(ret));
+      } else {
+        applied = true;
+      }
+    }
+    if (temporal_aq > 0) {
+      // 注意: 部分 GPU 不支持 temporal AQ, ffmpeg 的能力检查会返回 ENOSYS,
+      // 由调用方在 avcodec_open2 失败时去掉增强项重试
+      if ((ret = av_opt_set_int(priv_data, "temporal-aq", 1, 0)) < 0) {
+        LOG_ERROR(std::string("nvenc set opt temporal-aq failed, ret = ") +
+                  av_err2str(ret));
+      } else {
+        applied = true;
+      }
+    }
+    // 1 = two pass, quarter resolution; 2 = two pass, full resolution
+    if (multipass == 1 || multipass == 2) {
+      const char *v = multipass == 2 ? "fullres" : "qres";
+      if ((ret = av_opt_set(priv_data, "multipass", v, 0)) < 0) {
+        LOG_ERROR(std::string("nvenc set opt multipass ") + v +
+                  " failed, ret = " + av_err2str(ret));
+      } else {
+        applied = true;
+      }
+    }
+  } else if (name.find("amf") != std::string::npos) {
+    if (preanalysis > 0) {
+      if ((ret = av_opt_set_int(priv_data, "preanalysis", 1, 0)) < 0) {
+        LOG_ERROR(std::string("amf set opt preanalysis failed, ret = ") +
+                  av_err2str(ret));
+      } else {
+        applied = true;
+      }
+    }
+  }
+
+  if (applied) {
+    LOG_INFO("encode enhance: name=" + name + ", spatial_aq=" +
+             std::to_string(spatial_aq) + ", temporal_aq=" +
+             std::to_string(temporal_aq) + ", multipass=" +
+             std::to_string(multipass) + ", preanalysis=" +
+             std::to_string(preanalysis));
+  }
+  return applied;
+}
 bool set_gpu(void *priv_data, const std::string &name, int gpu) {
   int ret;
   if (gpu < 0)

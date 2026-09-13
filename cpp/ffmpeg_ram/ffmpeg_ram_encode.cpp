@@ -110,6 +110,12 @@ public:
   int quality_ = 0;
   int kbs_ = 0;
   int q_ = 0;
+  int spatial_aq_ = 0;
+  int temporal_aq_ = 0;
+  int multipass_ = 0;
+  int preanalysis_ = 0;
+  // 是否应用过画质增强项 (avcodec_open2 失败时据此去掉增强项重试一次)
+  bool enhance_applied_ = false;
   int fps_ = 30;
   int gop_ = 0xFFFF;
   int thread_count_ = 1;
@@ -124,7 +130,8 @@ public:
 
   FFmpegRamEncoder(const char *name, const char *mc_name, int width, int height,
                    int pixfmt, int align, int fps, int gop, int rc, int quality,
-                   int kbs, int q, int thread_count, int gpu,
+                   int kbs, int q, int spatial_aq, int temporal_aq,
+                   int multipass, int preanalysis, int thread_count, int gpu,
                    RamEncodeCallback callback) {
     name_ = name;
     mc_name_ = mc_name ? mc_name : "";
@@ -138,6 +145,10 @@ public:
     quality_ = quality;
     kbs_ = kbs;
     q_ = q;
+    spatial_aq_ = spatial_aq;
+    temporal_aq_ = temporal_aq;
+    multipass_ = multipass;
+    preanalysis_ = preanalysis;
     thread_count_ = thread_count;
     gpu_ = gpu;
     callback_ = callback;
@@ -243,6 +254,9 @@ public:
       LOG_ERROR(std::string("set_quality failed, keep the default preset, name: ") + name_);
     }
     util_encode::set_rate_control(c_, name_, rc_, q_);
+    enhance_applied_ = util_encode::set_encode_enhance(
+        c_->priv_data, name_, spatial_aq_, temporal_aq_, multipass_,
+        preanalysis_);
     util_encode::set_gpu(c_->priv_data, name_, gpu_);
     util_encode::force_hw(c_->priv_data, name_);
     util_encode::set_others(c_->priv_data, name_);
@@ -261,8 +275,20 @@ public:
       }
     }
 
-    if ((ret = avcodec_open2(c_, codec, NULL)) < 0) {
-      LOG_ERROR(std::string("avcodec_open2 failed, ret = ") + av_err2str(ret) +
+    int open_ret = avcodec_open2(c_, codec, NULL);
+    if (open_ret < 0 && enhance_applied_) {
+      // 画质增强是可选项: 部分 GPU/驱动会拒绝 (例如 nvenc 的 temporal AQ 能力检查
+      // 返回 ENOSYS, amf 不支持 preanalysis 属性)。此时去掉增强项重试一次,
+      // 而不是让远程会话建不起来。
+      LOG_WARN(std::string("avcodec_open2 failed with encode enhancement, retry "
+                           "without them, ret = ") +
+               av_err2str(open_ret) + ", name: " + name_);
+      util_encode::set_encode_enhance(c_->priv_data, name_, 0, 0, 0, 0);
+      enhance_applied_ = false;
+      open_ret = avcodec_open2(c_, codec, NULL);
+    }
+    if (open_ret < 0) {
+      LOG_ERROR(std::string("avcodec_open2 failed, ret = ") + av_err2str(open_ret) +
                 ", name: " + name_);
       return false;
     }

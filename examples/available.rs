@@ -37,6 +37,10 @@ fn ram() {
         quality: Quality_Default,
         rc: RC_CBR,
         q: -1,
+        spatial_aq: false,
+        temporal_aq: false,
+        multipass: 0,
+        preanalysis: false,
         thread_count: 1,
     };
     let encoders = Encoder::available_encoders(ctx.clone(), None);
