@@ -447,14 +447,16 @@ private:
 extern "C" FFmpegRamEncoder *
 ffmpeg_ram_new_encoder(const char *name, const char *mc_name, int width,
                        int height, int pixfmt, int align, int fps, int gop,
-                       int rc, int quality, int kbs, int q, int thread_count,
-                       int gpu, int *linesize, int *offset, int *length,
-                       RamEncodeCallback callback) {
+                       int rc, int quality, int kbs, int q, int spatial_aq,
+                       int temporal_aq, int multipass, int preanalysis,
+                       int thread_count, int gpu, int *linesize, int *offset,
+                       int *length, RamEncodeCallback callback) {
   FFmpegRamEncoder *encoder = NULL;
   try {
     encoder = new FFmpegRamEncoder(name, mc_name, width, height, pixfmt, align,
-                                   fps, gop, rc, quality, kbs, q, thread_count,
-                                   gpu, callback);
+                                   fps, gop, rc, quality, kbs, q, spatial_aq,
+                                   temporal_aq, multipass, preanalysis,
+                                   thread_count, gpu, callback);
     if (encoder) {
       if (encoder->init(linesize, offset, length)) {
         return encoder;
