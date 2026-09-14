@@ -291,6 +291,29 @@ bool set_rate_control(AVCodecContext *c, const std::string &name, int rc,
                  std::to_string(q));
       }
     }
+    // qsv 的码控模式由 AVCodecContext 字段决定 (qsvenc.c select_rc_mode), 没有 "rc" 选项,
+    // 因此这里回读一次, 把 ffmpeg 真正会选中的模式打出来, 避免出现
+    // "设了 CBR/CQ 但实际走的是 VBR" 这类静默失效。
+    std::string mode;
+    if (c->global_quality > 0 && c->rc_max_rate == 0) {
+      mode = "ICQ(global_quality=" + std::to_string(c->global_quality) + ")";
+    } else if (c->bit_rate > 0 && c->bit_rate == c->rc_max_rate) {
+      mode = "CBR(bit_rate=" + std::to_string(c->bit_rate) + ")";
+    } else if (c->bit_rate > 0 || c->rc_max_rate > 0) {
+      mode = "VBR(target=" + std::to_string(c->bit_rate) +
+             ", max=" + std::to_string(c->rc_max_rate) + ")";
+    } else {
+      mode = "CQP(no bitrate/quality set, ffmpeg default QP)";
+    }
+    const bool mismatch =
+        (rc == RC_CBR && mode.compare(0, 3, "CBR") != 0) ||
+        (rc == RC_CQ && mode.compare(0, 3, "ICQ") != 0);
+    if (mismatch) {
+      LOG_WARN("qsv rate control mismatch: requested rc=" + std::to_string(rc) +
+               " but ffmpeg will use " + mode + ", name: " + name);
+    } else {
+      LOG_INFO("qsv rate control: " + mode + ", name: " + name);
+    }
   }
 
   return true;
@@ -341,6 +364,21 @@ bool set_encode_enhance(void *priv_data, const std::string &name, int spatial_aq
     }
   }
 
+  const bool requested = spatial_aq > 0 || temporal_aq > 0 ||
+                         multipass == 1 || multipass == 2 || preanalysis > 0;
+  if (requested && !applied) {
+    // 典型场景: Intel QSV / videotoolbox / vaapi 上开了 AQ/multipass。
+    // 这些增强项只有 nvenc (spatial/temporal aq, multipass) 与 amf (preanalysis) 支持,
+    // 其余编码器上会静默无效 —— 明确告警, 避免误以为参数已生效。
+    LOG_WARN("encode enhance ignored: " + name +
+             " supports none of the requested options (spatial_aq/temporal_aq/"
+             "multipass are nvenc only, preanalysis is amf only), requested "
+             "spatial_aq=" +
+             std::to_string(spatial_aq) + ", temporal_aq=" +
+             std::to_string(temporal_aq) + ", multipass=" +
+             std::to_string(multipass) + ", preanalysis=" +
+             std::to_string(preanalysis));
+  }
   if (applied) {
     LOG_INFO("encode enhance: name=" + name + ", spatial_aq=" +
              std::to_string(spatial_aq) + ", temporal_aq=" +

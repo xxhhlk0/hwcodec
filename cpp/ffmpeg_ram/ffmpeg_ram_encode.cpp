@@ -260,11 +260,16 @@ public:
     util_encode::set_gpu(c_->priv_data, name_, gpu_);
     util_encode::force_hw(c_->priv_data, name_);
     util_encode::set_others(c_->priv_data, name_);
+    // 打印请求参数 + 解码器实际拿到的码控字段, 便于确认 rc/preset/QP 是否真的生效
+    // (例如 qsv + rc=CQ 时 bit_rate/rc_max_rate 应为 0, global_quality = q -> ffmpeg 选 ICQ)
     LOG_INFO("hw encode params: name=" + name_ +
              ", quality=" + std::to_string(quality_) + ", rc=" +
              std::to_string(rc_) + ", q=" + std::to_string(q_) +
              ", kbs=" + std::to_string(kbs_) + ", fps=" + std::to_string(fps_) +
-             ", gop=" + std::to_string(gop_));
+             ", gop=" + std::to_string(gop_) +
+             ", bit_rate=" + std::to_string(c_->bit_rate) +
+             ", rc_max_rate=" + std::to_string(c_->rc_max_rate) +
+             ", global_quality=" + std::to_string(c_->global_quality));
     if (name_.find("mediacodec") != std::string::npos) {
       if (mc_name_.length() > 0) {
         LOG_INFO(std::string("mediacodec codec_name: ") + mc_name_);
@@ -292,6 +297,12 @@ public:
                 ", name: " + name_);
       return false;
     }
+    // open 之后 ffmpeg 才真正选定码控模式, 并可能回填这些字段;
+    // 排查"参数到底生效没有"以这一行为准 (与上面 hw encode params 对比)。
+    LOG_INFO("hw encode opened: name=" + name_ +
+             ", bit_rate=" + std::to_string(c_->bit_rate) +
+             ", rc_max_rate=" + std::to_string(c_->rc_max_rate) +
+             ", global_quality=" + std::to_string(c_->global_quality));
 
     if (ffmpeg_ram_get_linesize_offset_length(pixfmt_, width_, height_, align_,
                                               NULL, offset_, length) != 0)
