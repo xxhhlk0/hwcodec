@@ -8,7 +8,9 @@ int amf_driver_support();
 
 void *amf_new_encoder(void *handle, int64_t luid,
                       int32_t data_format, int32_t width, int32_t height,
-                      int32_t bitrate, int32_t framerate, int32_t gop);
+                      int32_t bitrate, int32_t framerate, int32_t gop,
+                      int quality, int rc, int q, int spatial_aq,
+                      int temporal_aq, int multipass, int preanalysis);
 
 int amf_encode(void *encoder, void *texture, EncodeCallback callback, void *obj,
                int64_t ms);

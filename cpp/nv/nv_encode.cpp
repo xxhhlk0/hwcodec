@@ -338,7 +338,12 @@ int nv_destroy_encoder(void *encoder) {
 
 void *nv_new_encoder(void *handle, int64_t luid, DataFormat dataFormat,
                      int32_t width, int32_t height, int32_t kbs,
-                     int32_t framerate, int32_t gop) {
+                     int32_t framerate, int32_t gop,
+                     int quality, int rc, int q, int spatial_aq,
+                     int temporal_aq, int multipass, int preanalysis) {
+  // native NVENC path does not consume the ffmpeg-style encode profile args yet
+  (void)quality; (void)rc; (void)q; (void)spatial_aq; (void)temporal_aq;
+  (void)multipass; (void)preanalysis;
   NvencEncoder *e = NULL;
   try {
     e = new NvencEncoder(handle, luid, dataFormat, width, height, kbs,
@@ -406,7 +411,8 @@ int nv_test_encode(int64_t *outLuids, int32_t *outVendors, int32_t maxDescNum, i
 
       NvencEncoder *e = (NvencEncoder *)nv_new_encoder(
           (void *)adapter.get()->device_.Get(), currentLuid,
-          dataFormat, width, height, kbs, framerate, gop);
+          dataFormat, width, height, kbs, framerate, gop,
+          Quality_Default, RC_CBR, -1, 0, 0, 0, 0);
       if (!e)
         continue;
       if (e->native_->EnsureTexture(e->width_, e->height_)) {

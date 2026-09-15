@@ -10,6 +10,13 @@ pub type NewEncoderCall = unsafe extern "C" fn(
     bitrate: i32,
     framerate: i32,
     gop: i32,
+    quality: c_int,
+    rc: c_int,
+    q: c_int,
+    spatial_aq: c_int,
+    temporal_aq: c_int,
+    multipass: c_int,
+    preanalysis: c_int,
 ) -> *mut c_void;
 
 pub type EncodeCall = unsafe extern "C" fn(

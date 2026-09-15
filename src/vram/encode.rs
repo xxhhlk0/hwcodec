@@ -42,6 +42,13 @@ impl Encoder {
                 ctx.d.kbitrate,
                 ctx.d.framerate,
                 ctx.d.gop,
+                ctx.d.quality,
+                ctx.d.rc,
+                ctx.d.q,
+                ctx.d.spatial_aq as c_int,
+                ctx.d.temporal_aq as c_int,
+                ctx.d.multipass,
+                ctx.d.preanalysis as c_int,
             );
             if codec.is_null() {
                 return Err(());

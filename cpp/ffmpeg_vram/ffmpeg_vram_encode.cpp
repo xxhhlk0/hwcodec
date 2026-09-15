@@ -76,13 +76,23 @@ public:
   int32_t kbs_;
   int32_t framerate_;
   int32_t gop_;
+  int quality_;
+  int rc_;
+  int q_;
+  int spatial_aq_;
+  int temporal_aq_;
+  int multipass_;
+  int preanalysis_;
+  bool enhance_applied_ = false;
 
   const int align_ = 0;
   const bool full_range_ = false;
   const bool bt709_ = false;
   FFmpegVRamEncoder(void *handle, int64_t luid, DataFormat dataFormat,
                     int32_t width, int32_t height, int32_t kbs,
-                    int32_t framerate, int32_t gop) {
+                    int32_t framerate, int32_t gop, int quality, int rc,
+                    int q, int spatial_aq, int temporal_aq, int multipass,
+                    int preanalysis) {
     handle_ = handle;
     luid_ = luid;
     dataFormat_ = dataFormat;
@@ -91,6 +101,13 @@ public:
     kbs_ = kbs;
     framerate_ = framerate;
     gop_ = gop;
+    quality_ = quality;
+    rc_ = rc;
+    q_ = q;
+    spatial_aq_ = spatial_aq;
+    temporal_aq_ = temporal_aq;
+    multipass_ = multipass;
+    preanalysis_ = preanalysis;
   }
 
   ~FFmpegVRamEncoder() {}
@@ -133,9 +150,34 @@ public:
     if (!util_encode::set_lantency_free(c_->priv_data, encoder_->name_)) {
       return false;
     }
-    // util_encode::set_quality(c_->priv_data, encoder_->name_, Quality_Default);
-    util_encode::set_rate_control(c_, encoder_->name_, RC_CBR, -1);
+    // preset/quality: previously commented out (Quality_Default is a no-op), so the
+    // encode profile preset had no effect on the vram path. Same mapping as the RAM path.
+    if (!util_encode::set_quality(c_->priv_data, encoder_->name_, quality_)) {
+      // do not fail the session, just keep the encoder default preset
+      LOG_ERROR(std::string("set_quality failed, keep the default preset, name: ") +
+                encoder_->name_);
+    }
+    // rc: RC_DEFAULT (no profile) keeps the legacy behaviour of this path (CBR)
+    util_encode::set_rate_control(c_, encoder_->name_,
+                                  rc_ == RC_DEFAULT ? RC_CBR : (RateControl)rc_,
+                                  q_);
+    if (spatial_aq_ > 0 || temporal_aq_ > 0 || multipass_ > 0 ||
+        preanalysis_ > 0) {
+      enhance_applied_ = util_encode::set_encode_enhance(
+          c_->priv_data, encoder_->name_, spatial_aq_, temporal_aq_,
+          multipass_, preanalysis_);
+    }
     util_encode::set_others(c_->priv_data, encoder_->name_);
+    // 与 RAM 通道一致: 打印请求参数 + open 后 ffmpeg 实际选定的码控字段,
+    // 便于确认 rc/preset/QP 是否真的生效 (qsv + rc=CQ -> ICQ, global_quality = q)
+    LOG_INFO("hw encode params: name=" + encoder_->name_ +
+             ", quality=" + std::to_string(quality_) + ", rc=" +
+             std::to_string(rc_) + ", q=" + std::to_string(q_) +
+             ", kbs=" + std::to_string(kbs_) + ", fps=" +
+             std::to_string(framerate_) + ", gop=" + std::to_string(gop_) +
+             ", bit_rate=" + std::to_string(c_->bit_rate) +
+             ", rc_max_rate=" + std::to_string(c_->rc_max_rate) +
+             ", global_quality=" + std::to_string(c_->global_quality));
 
     hw_device_ctx_ = av_hwdevice_ctx_alloc(encoder_->device_type_);
     if (!hw_device_ctx_) {
@@ -179,11 +221,29 @@ public:
       return false;
     }
 
-    if ((ret = avcodec_open2(c_, codec, NULL)) < 0) {
-      LOG_ERROR(std::string("avcodec_open2 failed, ret = ") + av_err2str(ret) +
-                ", name: " + encoder_->name_);
+    int open_ret = avcodec_open2(c_, codec, NULL);
+    if (open_ret < 0 && enhance_applied_) {
+      // 画质增强是可选项: 部分 GPU/驱动会拒绝。此时去掉增强项重试一次,
+      // 而不是让远程会话建不起来 (与 RAM 通道行为一致)。
+      LOG_WARN(std::string("avcodec_open2 failed with encode enhancement, retry "
+                           "without them, ret = ") +
+               av_err2str(open_ret) + ", name: " + encoder_->name_);
+      util_encode::set_encode_enhance(c_->priv_data, encoder_->name_, 0, 0, 0,
+                                      0);
+      enhance_applied_ = false;
+      open_ret = avcodec_open2(c_, codec, NULL);
+    }
+    if (open_ret < 0) {
+      LOG_ERROR(std::string("avcodec_open2 failed, ret = ") +
+                av_err2str(open_ret) + ", name: " + encoder_->name_);
       return false;
     }
+    // open 之后 ffmpeg 才真正选定码控模式, 并可能回填这些字段;
+    // 排查"参数到底生效没有"以这一行为准 (与上面 hw encode params 对比)。
+    LOG_INFO("hw encode opened: name=" + encoder_->name_ +
+             ", bit_rate=" + std::to_string(c_->bit_rate) +
+             ", rc_max_rate=" + std::to_string(c_->rc_max_rate) +
+             ", global_quality=" + std::to_string(c_->global_quality));
 
     if (!(frame_ = av_frame_alloc())) {
       LOG_ERROR(std::string("Could not allocate video frame"));
@@ -432,11 +492,16 @@ extern "C" {
 FFmpegVRamEncoder *ffmpeg_vram_new_encoder(void *handle, int64_t luid,
                                            DataFormat dataFormat, int32_t width,
                                            int32_t height, int32_t kbs,
-                                           int32_t framerate, int32_t gop) {
+                                           int32_t framerate, int32_t gop,
+                                           int quality, int rc, int q,
+                                           int spatial_aq, int temporal_aq,
+                                           int multipass, int preanalysis) {
   FFmpegVRamEncoder *encoder = NULL;
   try {
     encoder = new FFmpegVRamEncoder(handle, luid, dataFormat, width,
-                                    height, kbs, framerate, gop);
+                                    height, kbs, framerate, gop, quality, rc,
+                                    q, spatial_aq, temporal_aq, multipass,
+                                    preanalysis);
     if (encoder) {
       if (encoder->init()) {
         return encoder;
@@ -486,7 +551,7 @@ int ffmpeg_vram_set_bitrate(FFmpegVRamEncoder *encoder, int kbs) {
 
 int ffmpeg_vram_set_framerate(FFmpegVRamEncoder *encoder, int32_t framerate) {
   try {
-    return encoder->set_bitrate(framerate);
+    return encoder->set_framerate(framerate);
   } catch (const std::exception &e) {
     LOG_ERROR(std::string("ffmpeg_vram_set_framerate failed, ") + std::string(e.what()));
   }
@@ -522,7 +587,8 @@ int ffmpeg_vram_test_encode(int64_t *outLuids, int32_t *outVendors, int32_t maxD
         
         FFmpegVRamEncoder *e = (FFmpegVRamEncoder *)ffmpeg_vram_new_encoder(
             (void *)adapter.get()->device_.Get(), currentLuid,
-            dataFormat, width, height, kbs, framerate, gop);
+            dataFormat, width, height, kbs, framerate, gop,
+            Quality_Default, RC_CBR, -1, 0, 0, 0, 0);
         if (!e)
           continue;
         if (e->native_->EnsureTexture(e->width_, e->height_)) {

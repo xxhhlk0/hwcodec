@@ -15,7 +15,9 @@ int ffmpeg_vram_test_decode(int64_t *outLuids, int32_t *outVendors, int32_t maxD
                             const int64_t *excludedLuids, const int32_t *excludeFormats, int32_t excludeCount);
 void *ffmpeg_vram_new_encoder(void *handle, int64_t luid,
                               int32_t dataFormat, int32_t width, int32_t height,
-                              int32_t kbs, int32_t framerate, int32_t gop);
+                              int32_t kbs, int32_t framerate, int32_t gop,
+                              int quality, int rc, int q, int spatial_aq,
+                              int temporal_aq, int multipass, int preanalysis);
 
 int ffmpeg_vram_encode(void *encoder, void *tex, EncodeCallback callback,
                        void *obj, int64_t ms);

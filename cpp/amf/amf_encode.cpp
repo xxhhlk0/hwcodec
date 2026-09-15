@@ -471,7 +471,12 @@ int amf_destroy_encoder(void *encoder) {
 
 void *amf_new_encoder(void *handle, int64_t luid,
                       DataFormat dataFormat, int32_t width, int32_t height,
-                      int32_t kbs, int32_t framerate, int32_t gop) {
+                      int32_t kbs, int32_t framerate, int32_t gop,
+                      int quality, int rc, int q, int spatial_aq,
+                      int temporal_aq, int multipass, int preanalysis) {
+  // native AMF path does not consume the ffmpeg-style encode profile args yet
+  (void)quality; (void)rc; (void)q; (void)spatial_aq; (void)temporal_aq;
+  (void)multipass; (void)preanalysis;
   AMFEncoder *enc = NULL;
   try {
     amf_wstring codecStr;
@@ -541,7 +546,8 @@ int amf_test_encode(int64_t *outLuids, int32_t *outVendors, int32_t maxDescNum, 
       
       AMFEncoder *e = (AMFEncoder *)amf_new_encoder(
           (void *)adapter.get()->device_.Get(), currentLuid,
-          dataFormat, width, height, kbs, framerate, gop);
+          dataFormat, width, height, kbs, framerate, gop,
+          Quality_Default, RC_CBR, -1, 0, 0, 0, 0);
       if (!e)
         continue;
       if (e->test() == AMF_OK) {

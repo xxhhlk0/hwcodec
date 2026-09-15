@@ -22,7 +22,7 @@ pub struct FeatureContext {
     pub data_format: DataFormat,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 pub struct DynamicContext {
     #[serde(skip)]
     pub device: Option<*mut c_void>,
@@ -31,6 +31,17 @@ pub struct DynamicContext {
     pub kbitrate: i32,
     pub framerate: i32,
     pub gop: i32,
+    /// 编码预设 (Quality enum value, 0 = Default 即编码器默认 preset)
+    pub quality: i32,
+    /// 码率控制 (RateControl enum value, 0 = Default 时 C 侧回退到 CBR 保持旧行为)
+    pub rc: i32,
+    /// CQ/ICQ 的 QP 值, -1 表示不设置
+    pub q: i32,
+    pub spatial_aq: bool,
+    pub temporal_aq: bool,
+    /// nvenc multipass: 0=disabled 1=two pass quarter res 2=two pass full res
+    pub multipass: i32,
+    pub preanalysis: bool,
 }
 
 unsafe impl Send for DynamicContext {}

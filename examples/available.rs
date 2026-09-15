@@ -63,6 +63,7 @@ fn vram() {
         framerate: 30,
         gop: MAX_GOP as _,
         device: None,
+        ..Default::default()
     });
     encoders.iter().map(|e| println!("{:?}", e)).count();
     println!("decoders:");
