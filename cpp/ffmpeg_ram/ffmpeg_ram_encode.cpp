@@ -11,6 +11,7 @@ extern "C" {
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <vector>
 
 #include "common.h"
 
@@ -128,7 +129,11 @@ public:
   AVHWDeviceType hw_device_type_ = AV_HWDEVICE_TYPE_NONE;
   AVPixelFormat hw_pixfmt_ = AV_PIX_FMT_NONE;
   AVBufferRef *hw_device_ctx_ = NULL;
-  AVFrame *hw_frame_ = NULL;
+  // 环形 surface 池: 每帧轮流用不同池 surface 上传, 避免 QSV/VAAPI 流水线被单
+  // surface 串行化 (实测 async_depth=2 零收益、编码 13~14ms/帧 的根因)。
+  // 数量 hw_pool_size(), 默认 4。
+  std::vector<AVFrame *> hw_frames_;
+  size_t hw_ring_pos_ = 0;
 
   FFmpegRamEncoder(const char *name, const char *mc_name, int width, int height,
                    int pixfmt, int align, int fps, int gop, int rc, int quality,
@@ -204,19 +209,26 @@ public:
         LOG_ERROR(std::string("set_hwframe_ctx failed"));
         return false;
       }
-      hw_frame_ = av_frame_alloc();
-      if (!hw_frame_) {
-        LOG_ERROR(std::string("av_frame_alloc failed"));
-        return false;
+      const int pool = util_encode::hw_pool_size();
+      for (int i = 0; i < pool; i++) {
+        AVFrame *f = av_frame_alloc();
+        if (!f) {
+          LOG_ERROR(std::string("av_frame_alloc failed"));
+          return false;
+        }
+        if ((ret = av_hwframe_get_buffer(c_->hw_frames_ctx, f, 0)) < 0) {
+          LOG_ERROR(std::string("av_hwframe_get_buffer failed, ret = ") + av_err2str(ret));
+          av_frame_free(&f);
+          return false;
+        }
+        if (!f->hw_frames_ctx) {
+          LOG_ERROR(std::string("hw_frame_->hw_frames_ctx is NULL"));
+          av_frame_free(&f);
+          return false;
+        }
+        hw_frames_.push_back(f);
       }
-      if ((ret = av_hwframe_get_buffer(c_->hw_frames_ctx, hw_frame_, 0)) < 0) {
-        LOG_ERROR(std::string("av_hwframe_get_buffer failed, ret = ") + av_err2str(ret));
-        return false;
-      }
-      if (!hw_frame_->hw_frames_ctx) {
-        LOG_ERROR(std::string("hw_frame_->hw_frames_ctx is NULL"));
-        return false;
-      }
+      LOG_INFO("hw surface pool: size=" + std::to_string(pool) + ", name=" + name_);
     }
 
     if (!(frame_ = av_frame_alloc())) {
@@ -341,11 +353,14 @@ public:
       return ret;
     AVFrame *tmp_frame;
     if (hw_device_type_ != AV_HWDEVICE_TYPE_NONE) {
-      if ((ret = av_hwframe_transfer_data(hw_frame_, frame_, 0)) < 0) {
+      // 环形取下一块 surface
+      AVFrame *hw_frame = hw_frames_[hw_ring_pos_];
+      hw_ring_pos_ = (hw_ring_pos_ + 1) % hw_frames_.size();
+      if ((ret = av_hwframe_transfer_data(hw_frame, frame_, 0)) < 0) {
         LOG_ERROR(std::string("av_hwframe_transfer_data failed, ret = ") + av_err2str(ret));
         return ret;
       }
-      tmp_frame = hw_frame_;
+      tmp_frame = hw_frame;
     } else {
       tmp_frame = frame_;
     }
@@ -358,8 +373,9 @@ public:
       av_packet_free(&pkt_);
     if (frame_)
       av_frame_free(&frame_);
-    if (hw_frame_)
-      av_frame_free(&hw_frame_);
+    for (auto *f : hw_frames_)
+      av_frame_free(&f);
+    hw_frames_.clear();
     if (hw_device_ctx_)
       av_buffer_unref(&hw_device_ctx_);
     if (c_)
@@ -385,7 +401,8 @@ private:
     frames_ctx->sw_format = (AVPixelFormat)pixfmt_;
     frames_ctx->width = width_;
     frames_ctx->height = height_;
-    frames_ctx->initial_pool_size = 1;
+    // 池 >= 管线深度, 否则 async_depth > 1 无从流水线 (见 hw_frames_ 注释)
+    frames_ctx->initial_pool_size = util_encode::hw_pool_size();
     if ((err = av_hwframe_ctx_init(hw_frames_ref)) < 0) {
       av_buffer_unref(&hw_frames_ref);
       return err;

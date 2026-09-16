@@ -15,6 +15,7 @@ extern "C" {
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <vector>
 
 #include "callback.h"
 #include "common.h"
@@ -59,9 +60,14 @@ class FFmpegVRamEncoder {
 public:
   AVCodecContext *c_ = NULL;
   AVBufferRef *hw_device_ctx_ = NULL;
-  AVFrame *frame_ = NULL;
-  AVFrame *mapped_frame_ = NULL;
-  ID3D11Texture2D *encode_texture_ = NULL; // no free
+  // surface 环形池: 池 = 1 时每帧写入必须等上一帧编码完, 流水线彻底失效
+  // (实测 async_depth=2 零收益、编码 13~14ms/帧)。数量 hw_pool_size(), 默认 4。
+  std::vector<AVFrame *> frames_;
+  // QSV: 映射到 D3D11 的帧, 与 frames_ 一一对应; 其余驱动为 NULL
+  std::vector<AVFrame *> mapped_frames_;
+  // 每帧对应的可写 NV12 纹理
+  std::vector<ID3D11Texture2D *> textures_;
+  size_t ring_pos_ = 0;
   AVPacket *pkt_ = NULL;
   std::unique_ptr<NativeDevice> native_ = nullptr;
   ID3D11Device *d3d11Device_ = NULL;
@@ -260,59 +266,84 @@ public:
              ", rc_max_rate=" + std::to_string(c_->rc_max_rate) +
              ", global_quality=" + std::to_string(c_->global_quality));
 
-    if (!(frame_ = av_frame_alloc())) {
-      LOG_ERROR(std::string("Could not allocate video frame"));
-      return false;
-    }
-    frame_->format = c_->pix_fmt;
-    frame_->width = c_->width;
-    frame_->height = c_->height;
-    frame_->color_range = c_->color_range;
-    frame_->color_primaries = c_->color_primaries;
-    frame_->color_trc = c_->color_trc;
-    frame_->colorspace = c_->colorspace;
-    frame_->chroma_location = c_->chroma_sample_location;
+    // 从帧池取 hw_pool_size() 个 surface 组成环形队列。
+    // 只要池 >= 管线深度, 第 n+1 帧的写入就不会撞上第 n 帧的编码。
+    const int pool = util_encode::hw_pool_size();
+    for (int i = 0; i < pool; i++) {
+      AVFrame *f = av_frame_alloc();
+      if (!f) {
+        LOG_ERROR(std::string("Could not allocate video frame"));
+        return false;
+      }
+      f->format = c_->pix_fmt;
+      f->width = c_->width;
+      f->height = c_->height;
+      f->color_range = c_->color_range;
+      f->color_primaries = c_->color_primaries;
+      f->color_trc = c_->color_trc;
+      f->colorspace = c_->colorspace;
+      f->chroma_location = c_->chroma_sample_location;
 
-    if ((ret = av_hwframe_get_buffer(c_->hw_frames_ctx, frame_, 0)) < 0) {
-      LOG_ERROR(std::string("av_frame_get_buffer failed, ret = ") + av_err2str(ret));
-      return false;
-    }
-    if (frame_->format == AV_PIX_FMT_QSV) {
-      mapped_frame_ = av_frame_alloc();
-      if (!mapped_frame_) {
-        LOG_ERROR(std::string("Could not allocate mapped video frame"));
+      if ((ret = av_hwframe_get_buffer(c_->hw_frames_ctx, f, 0)) < 0) {
+        LOG_ERROR(std::string("av_frame_get_buffer failed, ret = ") + av_err2str(ret));
+        av_frame_free(&f);
         return false;
       }
-      mapped_frame_->format = AV_PIX_FMT_D3D11;
-      ret = av_hwframe_map(mapped_frame_, frame_,
-                           AV_HWFRAME_MAP_WRITE | AV_HWFRAME_MAP_OVERWRITE);
-      if (ret) {
-        LOG_ERROR(std::string("av_hwframe_map failed, err = ") + av_err2str(ret));
-        return false;
+      if (f->format == AV_PIX_FMT_QSV) {
+        AVFrame *m = av_frame_alloc();
+        if (!m) {
+          LOG_ERROR(std::string("Could not allocate mapped video frame"));
+          av_frame_free(&f);
+          return false;
+        }
+        m->format = AV_PIX_FMT_D3D11;
+        ret = av_hwframe_map(m, f, AV_HWFRAME_MAP_WRITE | AV_HWFRAME_MAP_OVERWRITE);
+        if (ret) {
+          LOG_ERROR(std::string("av_hwframe_map failed, err = ") + av_err2str(ret));
+          av_frame_free(&m);
+          av_frame_free(&f);
+          return false;
+        }
+        frames_.push_back(f);
+        mapped_frames_.push_back(m);
+        textures_.push_back((ID3D11Texture2D *)m->data[0]);
+      } else {
+        frames_.push_back(f);
+        mapped_frames_.push_back(NULL);
+        textures_.push_back((ID3D11Texture2D *)f->data[0]);
       }
-      encode_texture_ = (ID3D11Texture2D *)mapped_frame_->data[0];
-    } else {
-      encode_texture_ = (ID3D11Texture2D *)frame_->data[0];
     }
+    LOG_INFO("hw surface pool: size=" + std::to_string(pool) +
+             ", name=" + encoder_->name_);
 
     return true;
   }
 
   int encode(void *texture, EncodeCallback callback, void *obj, int64_t ms) {
+    // 环形取下一块 surface
+    AVFrame *f = frames_[ring_pos_];
+    ID3D11Texture2D *tex = textures_[ring_pos_];
+    ring_pos_ = (ring_pos_ + 1) % frames_.size();
 
-    if (!convert(texture))
+    if (!convert(texture, f, tex))
       return -1;
 
-    return do_encode(callback, obj, ms);
+    return do_encode(callback, obj, ms, f);
   }
 
   void destroy() {
     if (pkt_)
       av_packet_free(&pkt_);
-    if (frame_)
-      av_frame_free(&frame_);
-    if (mapped_frame_)
-      av_frame_free(&mapped_frame_);
+    for (auto *m : mapped_frames_) {
+      if (m)
+        av_frame_free(&m);
+    }
+    for (auto *f : frames_) {
+      av_frame_free(&f);
+    }
+    frames_.clear();
+    mapped_frames_.clear();
+    textures_.clear();
     if (c_)
       avcodec_free_context(&c_);
     if (hw_device_ctx_) {
@@ -386,11 +417,12 @@ private:
     }
     return false;
   }
-  int do_encode(EncodeCallback callback, const void *obj, int64_t ms) {
+  int do_encode(EncodeCallback callback, const void *obj, int64_t ms,
+                AVFrame *f) {
     int ret;
     bool encoded = false;
-    frame_->pts = ms;
-    if ((ret = avcodec_send_frame(c_, frame_)) < 0) {
+    f->pts = ms;
+    if ((ret = avcodec_send_frame(c_, f)) < 0) {
       LOG_ERROR(std::string("avcodec_send_frame failed, ret = ") + av_err2str(ret));
       return ret;
     }
@@ -428,10 +460,9 @@ private:
     return encoded ? 0 : -1;
   }
 
-  bool convert(void *texture) {
-    if (frame_->format == AV_PIX_FMT_D3D11 ||
-        frame_->format == AV_PIX_FMT_QSV) {
-      ID3D11Texture2D *texture2D = (ID3D11Texture2D *)encode_texture_;
+  bool convert(void *src_texture, AVFrame *f, ID3D11Texture2D *texture2D) {
+    if (f->format == AV_PIX_FMT_D3D11 ||
+        f->format == AV_PIX_FMT_QSV) {
       D3D11_TEXTURE2D_DESC desc;
       texture2D->GetDesc(&desc);
       if (desc.Format != DXGI_FORMAT_NV12) {
@@ -456,7 +487,7 @@ private:
           colorSpace_out = DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601;
         }
       }
-      if (!native_->BgraToNv12((ID3D11Texture2D *)texture, texture2D, width_,
+      if (!native_->BgraToNv12((ID3D11Texture2D *)src_texture, texture2D, width_,
                                height_, colorSpace_in, colorSpace_out)) {
         LOG_ERROR(std::string("convert: BgraToNv12 failed"));
         return false;
@@ -464,7 +495,7 @@ private:
       return true;
     } else {
       LOG_ERROR(std::string("convert: unsupported format, ") +
-                std::to_string(frame_->format));
+                std::to_string(f->format));
       return false;
     }
   }
@@ -486,7 +517,7 @@ private:
     frames_ctx->height = height_;
     frames_ctx->initial_pool_size = 0;
     if (encoder_->device_type_ == AV_HWDEVICE_TYPE_D3D11VA) {
-      frames_ctx->initial_pool_size = 1;
+      frames_ctx->initial_pool_size = util_encode::hw_pool_size();
       AVD3D11VAFramesContext *frames_hwctx =
           (AVD3D11VAFramesContext *)frames_ctx->hwctx;
       frames_hwctx->BindFlags = D3D11_BIND_RENDER_TARGET;

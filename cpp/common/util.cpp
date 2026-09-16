@@ -94,6 +94,11 @@ static int hw_env_int(const char *key, int fallback) {
 // HWCODEC_ASYNC_DEPTH=1 可退回上游行为。
 int hw_async_depth() { return hw_env_int("HWCODEC_ASYNC_DEPTH", 2); }
 
+// 硬件帧池大小。池里只有 1 个 surface 时, "下一帧写入" 必须等 "上一帧编码完",
+// async_depth > 1 的流水线完全无从谈起。默认 4: 足够 QSV 深度 2 的流水线
+// (写入/编码各占 1, 再留 2 个余量), 内存开销可忽略 (每 surface 约 w*h*1.5 字节显存)。
+int hw_pool_size() { return hw_env_int("HWCODEC_POOL_SIZE", 4); }
+
 bool set_lantency_free(void *priv_data, const std::string &name) {
   int ret;
 
