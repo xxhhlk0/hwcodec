@@ -382,10 +382,21 @@ private:
 
     auto start = util::now();
     while (ret >= 0 && util::elapsed_ms(start) < ENCODE_TIMEOUT_MS) {
-      if ((ret = avcodec_receive_packet(c_, pkt_)) < 0) {
-        if (ret != AVERROR(EAGAIN)) {
-          LOG_ERROR(std::string("avcodec_receive_packet failed, ret = ") + av_err2str(ret));
+      ret = avcodec_receive_packet(c_, pkt_);
+      if (ret == AVERROR(EAGAIN)) {
+        ret = 0;
+        if (encoded) {
+          // 当前帧的包已交付且管线已空: 与上游语义一致, 正常收工,
+          // 不能在这里空等到 ENCODE_TIMEOUT_MS, 否则每帧都会白等 1 秒。
+          break;
         }
+        // async_depth > 1 时首帧还没吐包: 需要等一会儿再取, 直接返回失败会被
+        // 调用方当成编码错误 (首帧甚至会切掉硬件编码器)。
+        util::sleep_ms(1);
+        continue;
+      }
+      if (ret < 0) {
+        LOG_ERROR(std::string("avcodec_receive_packet failed, ret = ") + av_err2str(ret));
         goto _exit;
       }
       if (!pkt_->data || !pkt_->size) {

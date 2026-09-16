@@ -3,6 +3,7 @@
 
 #include <string>
 #include <chrono>
+#include <thread>
 extern "C" {
 #include <libavcodec/avcodec.h>
 }
@@ -40,6 +41,13 @@ namespace util {
 
     inline int64_t elapsed_ms(std::chrono::steady_clock::time_point start) {
         return std::chrono::duration_cast<std::chrono::milliseconds>(now() - start).count();
+    }
+
+    // 编码器 (async_depth > 1 的 QSV/VAAPI) 在管线未填满时可能暂时拿不到包。
+    // 这种情况应短暂等待, 而不是立即返回失败: 调用方会把"没包"当成编码失败,
+    // 首帧失败时甚至会直接切掉硬件编码器。
+    inline void sleep_ms(int64_t ms) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(ms));
     }
 
     inline bool skip_test(const int64_t *excludedLuids, const int32_t *excludeFormats, int32_t excludeCount, int64_t currentLuid, int32_t dataFormat) {

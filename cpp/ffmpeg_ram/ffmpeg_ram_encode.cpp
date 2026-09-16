@@ -395,10 +395,19 @@ private:
 
     auto start = util::now();
     while (ret >= 0 && util::elapsed_ms(start) < DECODE_TIMEOUT_MS) {
-      if ((ret = avcodec_receive_packet(c_, pkt_)) < 0) {
-        if (ret != AVERROR(EAGAIN)) {
-          LOG_ERROR(std::string("avcodec_receive_packet failed, ret = ") + av_err2str(ret));
+      ret = avcodec_receive_packet(c_, pkt_);
+      if (ret == AVERROR(EAGAIN)) {
+        ret = 0;
+        if (encoded) {
+          // 与 vram 路径同理: 已交付完当前帧的包就正常收工, 不要空等到超时。
+          break;
         }
+        // async_depth > 1 时首帧还没吐包, 需要等而不是直接返回失败。
+        util::sleep_ms(1);
+        continue;
+      }
+      if (ret < 0) {
+        LOG_ERROR(std::string("avcodec_receive_packet failed, ret = ") + av_err2str(ret));
         goto _exit;
       }
       if (!pkt_->data || !pkt_->size) {
