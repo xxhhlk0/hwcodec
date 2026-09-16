@@ -84,6 +84,8 @@ public:
   int multipass_;
   int preanalysis_;
   bool enhance_applied_ = false;
+  // 是否下发过 qsv 的 low_power/low_delay_brc (avcodec_open2 失败时据此回退重试)
+  bool qsv_low_latency_applied_ = false;
 
   const int align_ = 0;
   const bool full_range_ = false;
@@ -150,6 +152,9 @@ public:
     if (!util_encode::set_lantency_free(c_->priv_data, encoder_->name_)) {
       return false;
     }
+    // qsv: low_power + low_delay_brc (吞吐相关; 老核显不支持时由下方 open 回退)
+    qsv_low_latency_applied_ =
+        util_encode::apply_qsv_low_latency(c_->priv_data, encoder_->name_);
     // preset/quality: previously commented out (Quality_Default is a no-op), so the
     // encode profile preset had no effect on the vram path. Same mapping as the RAM path.
     if (!util_encode::set_quality(c_->priv_data, encoder_->name_, quality_)) {
@@ -231,6 +236,16 @@ public:
       util_encode::set_encode_enhance(c_->priv_data, encoder_->name_, 0, 0, 0,
                                       0);
       enhance_applied_ = false;
+      open_ret = avcodec_open2(c_, codec, NULL);
+    }
+    if (open_ret < 0 && qsv_low_latency_applied_) {
+      // low_power (VDENC) 在部分老核显/驱动上不被支持, 会让 open 直接失败。
+      // 回退成驱动默认再试一次, 而不是让远程会话建不起来。
+      LOG_WARN(std::string("avcodec_open2 failed with qsv low_power/low_delay_brc, "
+                           "retry without them, ret = ") +
+               av_err2str(open_ret) + ", name: " + encoder_->name_);
+      util_encode::revert_qsv_low_latency(c_->priv_data, encoder_->name_);
+      qsv_low_latency_applied_ = false;
       open_ret = avcodec_open2(c_, codec, NULL);
     }
     if (open_ret < 0) {

@@ -13,6 +13,13 @@ namespace util_encode {
 void set_av_codec_ctx(AVCodecContext *c, const std::string &name, int kbs,
                       int gop, int fps);
 bool set_lantency_free(void *priv_data, const std::string &name);
+// qsv/vaapi 硬件编码的吞吐相关选项 (上游写死的最低延迟值会腰斩吞吐),
+// 实测数据与覆盖用环境变量见 util.cpp 内注释。
+int hw_async_depth();
+// qsv: low_power=1 + low_delay_brc=1; 返回是否下发了至少一项 (调用方据此在
+// avcodec_open2 失败时回退重试)。非 qsv 编码器直接返回 false。
+bool apply_qsv_low_latency(void *priv_data, const std::string &name);
+bool revert_qsv_low_latency(void *priv_data, const std::string &name);
 bool set_quality(void *priv_data, const std::string &name, int quality);
 bool set_rate_control(AVCodecContext *c, const std::string &name, int rc,
                       int q);

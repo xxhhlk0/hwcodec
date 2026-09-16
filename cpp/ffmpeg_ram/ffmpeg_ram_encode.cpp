@@ -116,6 +116,8 @@ public:
   int preanalysis_ = 0;
   // 是否应用过画质增强项 (avcodec_open2 失败时据此去掉增强项重试一次)
   bool enhance_applied_ = false;
+  // 是否下发过 qsv 的 low_power/low_delay_brc (avcodec_open2 失败时据此回退重试)
+  bool qsv_low_latency_applied_ = false;
   int fps_ = 30;
   int gop_ = 0xFFFF;
   int thread_count_ = 1;
@@ -246,6 +248,9 @@ public:
       LOG_ERROR(std::string("set_lantency_free failed, name: ") + name_);
       return false;
     }
+    // qsv: low_power + low_delay_brc (吞吐相关; 老核显不支持时由下方 open 回退)
+    qsv_low_latency_applied_ =
+        util_encode::apply_qsv_low_latency(c_->priv_data, name_);
     // preset/quality: previously commented out, so the quality argument passed in from
     // rustdesk (encode profile) had no effect at all. Quality_Default is a no-op, so this
     // only changes behaviour when a non-default preset is explicitly requested.
@@ -290,6 +295,16 @@ public:
                av_err2str(open_ret) + ", name: " + name_);
       util_encode::set_encode_enhance(c_->priv_data, name_, 0, 0, 0, 0);
       enhance_applied_ = false;
+      open_ret = avcodec_open2(c_, codec, NULL);
+    }
+    if (open_ret < 0 && qsv_low_latency_applied_) {
+      // low_power (VDENC) 在部分老核显/驱动上不被支持, 会让 open 直接失败。
+      // 回退成驱动默认再试一次, 而不是让远程会话建不起来。
+      LOG_WARN(std::string("avcodec_open2 failed with qsv low_power/low_delay_brc, "
+                           "retry without them, ret = ") +
+               av_err2str(open_ret) + ", name: " + name_);
+      util_encode::revert_qsv_low_latency(c_->priv_data, name_);
+      qsv_low_latency_applied_ = false;
       open_ret = avcodec_open2(c_, codec, NULL);
     }
     if (open_ret < 0) {

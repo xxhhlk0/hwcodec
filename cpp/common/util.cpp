@@ -5,6 +5,7 @@ extern "C" {
 #include "util.h"
 #include <limits>
 #include <map>
+#include <stdlib.h>
 #include <string.h>
 #include <vector>
 
@@ -67,8 +68,31 @@ void set_av_codec_ctx(AVCodecContext *c, const std::string &name, int kbs,
 // 14代之前的核显 (如 UHD 750) 在 1440p 真实运动画面下实测
 //   async_depth=1 -> 89fps (11.2ms/帧)
 //   async_depth=2 -> 116fps (8.6ms/帧, 默认4也是同一水平)
+//   async_depth=2 + low_power=1 -> 154fps (6.5ms/帧) <-- 本分支采用, 见
+//      apply_qsv_low_latency(): 单独开 low_power 反而只有 56fps
 // 代价是多 1 帧管线延迟, 60fps 下约 16ms, 对远程桌面可以接受。
-#define HWCODEC_ASYNC_DEPTH 2
+// 环境变量覆盖, 便于不重新构建就调整 (改完重启 RustDesk 服务生效)
+static bool hw_env_flag(const char *key, bool fallback) {
+  const char *env = getenv(key);
+  if (env == nullptr || env[0] == '\0') {
+    return fallback;
+  }
+  return strcmp(env, "0") != 0;
+}
+
+static int hw_env_int(const char *key, int fallback) {
+  const char *env = getenv(key);
+  if (env == nullptr || env[0] == '\0') {
+    return fallback;
+  }
+  const int v = atoi(env);
+  return v > 0 ? v : fallback;
+}
+
+// qsv/vaapi 的硬件编码流水线深度。上游为"最低延迟"写死 1, 代价是 iGPU
+// 无法重叠 "取帧-编码-回读", 吞吐腰斩 (Intel UHD 750 @2560x1440 实测见下)。
+// HWCODEC_ASYNC_DEPTH=1 可退回上游行为。
+int hw_async_depth() { return hw_env_int("HWCODEC_ASYNC_DEPTH", 2); }
 
 bool set_lantency_free(void *priv_data, const std::string &name) {
   int ret;
@@ -86,20 +110,20 @@ bool set_lantency_free(void *priv_data, const std::string &name) {
     }
   }
   if (name.find("qsv") != std::string::npos) {
-    if ((ret = av_opt_set_int(priv_data, "async_depth", HWCODEC_ASYNC_DEPTH, 0)) < 0) {
+    const int async_depth = hw_async_depth();
+    if ((ret = av_opt_set_int(priv_data, "async_depth", async_depth, 0)) < 0) {
       LOG_ERROR(std::string("qsv set_lantency_free failed, ret = ") + av_err2str(ret));
       return false;
     }
-    LOG_INFO(std::string("qsv async_depth = ") +
-             std::to_string(HWCODEC_ASYNC_DEPTH));
+    LOG_INFO(std::string("qsv async_depth = ") + std::to_string(async_depth));
   }
   if (name.find("vaapi") != std::string::npos) {
-    if ((ret = av_opt_set_int(priv_data, "async_depth", HWCODEC_ASYNC_DEPTH, 0)) < 0) {
+    const int async_depth = hw_async_depth();
+    if ((ret = av_opt_set_int(priv_data, "async_depth", async_depth, 0)) < 0) {
       LOG_ERROR(std::string("vaapi set_lantency_free failed, ret = ") + av_err2str(ret));
       return false;
     }
-    LOG_INFO(std::string("vaapi async_depth = ") +
-             std::to_string(HWCODEC_ASYNC_DEPTH));
+    LOG_INFO(std::string("vaapi async_depth = ") + std::to_string(async_depth));
   }
   if (name.find("videotoolbox") != std::string::npos) {
     if ((ret = av_opt_set_int(priv_data, "realtime", 1, 0)) < 0) {
@@ -111,6 +135,54 @@ bool set_lantency_free(void *priv_data, const std::string &name) {
       return false;
     }
   }
+  return true;
+}
+
+// QSV 吞吐相关的两个开关 (上游都没设), 依据本分支在 Intel UHD 750 @2560x1440
+// (testsrc2 60fps, preset=veryfast, ICQ20) 的实测:
+//   async_depth=1                  ->  78~89fps
+//   async_depth=2                  ->  99~116fps
+//   async_depth=1 + low_power=1    ->  56fps   (单独开 low_power 反而更慢)
+//   async_depth=2 + low_power=1    -> 154fps   <-- 采用, 6.5ms/帧
+// low_delay_brc=1 与 low_power 搭配 (Sunshine 的 qsv 配置也是这样组合)。
+// low_power 走 VDENC 低功耗编码路径, 部分老核显/驱动不支持, 会让
+// avcodec_open2 直接失败 —— 所以调用方要在 open 失败后调用
+// revert_qsv_low_latency() 再重试一次, 而不是让会话建不起来。
+// 覆盖: HWCODEC_QSV_LOW_POWER=0 / HWCODEC_QSV_LOW_DELAY_BRC=0
+bool apply_qsv_low_latency(void *priv_data, const std::string &name) {
+  if (name.find("qsv") == std::string::npos) {
+    return false;
+  }
+  int ret;
+  bool applied = false;
+  if (hw_env_flag("HWCODEC_QSV_LOW_POWER", true)) {
+    if ((ret = av_opt_set_int(priv_data, "low_power", 1, 0)) < 0) {
+      LOG_ERROR(std::string("qsv set low_power failed, ret = ") + av_err2str(ret));
+    } else {
+      LOG_INFO("qsv low_power = 1");
+      applied = true;
+    }
+  }
+  if (hw_env_flag("HWCODEC_QSV_LOW_DELAY_BRC", true)) {
+    if ((ret = av_opt_set_int(priv_data, "low_delay_brc", 1, 0)) < 0) {
+      LOG_ERROR(std::string("qsv set low_delay_brc failed, ret = ") + av_err2str(ret));
+    } else {
+      LOG_INFO("qsv low_delay_brc = 1");
+      applied = true;
+    }
+  }
+  return applied;
+}
+
+// open 失败时的回退: 两个开关一起关掉 (低版本驱动可能只认其中一个), 由调用方再
+// open 一次。返回是否做过回退。
+bool revert_qsv_low_latency(void *priv_data, const std::string &name) {
+  if (name.find("qsv") == std::string::npos) {
+    return false;
+  }
+  av_opt_set_int(priv_data, "low_power", 0, 0);
+  av_opt_set_int(priv_data, "low_delay_brc", 0, 0);
+  LOG_WARN(std::string("qsv low_power/low_delay_brc reverted to 0, name: ") + name);
   return true;
 }
 
