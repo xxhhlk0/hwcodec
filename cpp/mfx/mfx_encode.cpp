@@ -1,4 +1,5 @@
 #include <cstring>
+#include <deque>
 #include <iostream>
 #include <libavutil/pixfmt.h>
 #include <limits>
@@ -58,6 +59,27 @@ public:
   std::vector<mfxU8> bstData_;
   mfxBitstream mfxBS_;
   mfxVideoParam mfxEncParams_;
+
+  // ---- async encode pipeline ----
+  // AsyncDepth=1 时每帧提交后立即 SyncOperation, MFX 编码延迟全额计入采集循环
+  // (1440p UHD750 实测空闲 ~8.4ms/帧, DWM 压力下被拉到 16~25ms, fps 卡在 ~44)。
+  // AsyncDepth>1 时编码在 GPU 上流水线化: 本帧提交后不等待, 包在后续调用中
+  // 收取 (输出滞后约一个采集周期, 换取吞吐)。HWCODEC_ASYNC_DEPTH=1 可退回。
+  bool async_ = false;
+  std::deque<struct PendingEnc> pending_;
+  std::vector<mfxBitstream> bsRing_;
+  std::vector<std::vector<mfxU8>> bsData_;
+  // D3D_CONVERT 用的 NV12 环形纹理: 每个在飞帧需要独立的转换目标
+  std::vector<ComPtr<ID3D11Texture2D>> nv12Ring_;
+  size_t nv12RingPos_ = 0;
+
+  struct PendingEnc {
+    mfxSyncPoint syncp;
+    mfxBitstream *bs;
+    ID3D11Texture2D *tex;
+    int64_t ms;
+  };
+
   mfxExtBuffer *extbuffers_[4] = {NULL, NULL, NULL, NULL};
   mfxExtCodingOption coding_option_;
   mfxExtCodingOption2 coding_option2_;
@@ -127,11 +149,35 @@ public:
              int64_t ms) {
     mfxStatus sts = MFX_ERR_NONE;
 
+    if (async_) {
+      // 流水线: 先非阻塞收取已完成包, 在飞深度保持 <= AsyncDepth
+      int ret = deliver_ready(callback, obj);
+      if (ret < 0)
+        return ret;
+    }
+
     int nEncSurfIdx =
         GetFreeSurfaceIndex(encSurfaces_.data(), encSurfaces_.size());
-    if (nEncSurfIdx >= encSurfaces_.size()) {
-      LOG_ERROR(std::string("no free enc surface"));
-      return -1;
+    if (nEncSurfIdx >= (int)encSurfaces_.size()) {
+      if (!async_) {
+        LOG_ERROR(std::string("no free enc surface"));
+        return -1;
+      }
+      // 回压: 在飞帧占满 surface 时收取已完成的再试
+      auto start = util::now();
+      while (nEncSurfIdx >= (int)encSurfaces_.size()) {
+        if (util::elapsed_ms(start) > ENCODE_TIMEOUT_MS) {
+          LOG_ERROR(std::string("no free enc surface"));
+          return -1;
+        }
+        int ret = deliver_ready(callback, obj);
+        if (ret < 0)
+          return ret;
+        if (pending_.empty())
+          Sleep(1);
+        nEncSurfIdx =
+            GetFreeSurfaceIndex(encSurfaces_.data(), encSurfaces_.size());
+      }
     }
     mfxFrameSurface1 *encSurf = &encSurfaces_[nEncSurfIdx];
 #ifdef CONFIG_USE_VPP
@@ -159,29 +205,81 @@ public:
         colorSpace_out = DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601;
       }
     }
-    if (!nv12Texture_) {
-      D3D11_TEXTURE2D_DESC desc;
-      ZeroMemory(&desc, sizeof(desc));
-      tex->GetDesc(&desc);
-      desc.Format = DXGI_FORMAT_NV12;
-      desc.MiscFlags = 0;
-      HRI(native_->device_->CreateTexture2D(
-          &desc, NULL, nv12Texture_.ReleaseAndGetAddressOf()));
+    if (!async_) {
+      if (!nv12Texture_) {
+        D3D11_TEXTURE2D_DESC desc;
+        ZeroMemory(&desc, sizeof(desc));
+        tex->GetDesc(&desc);
+        desc.Format = DXGI_FORMAT_NV12;
+        desc.MiscFlags = 0;
+        HRI(native_->device_->CreateTexture2D(
+            &desc, NULL, nv12Texture_.ReleaseAndGetAddressOf()));
+      }
+      if (!native_->BgraToNv12(tex, nv12Texture_.Get(), width_, height_,
+                               colorSpace_in, colorSpace_out)) {
+        LOG_ERROR(std::string("failed to convert to NV12"));
+        return -1;
+      }
+      encSurf->Data.MemId = nv12Texture_.Get();
+    } else {
+      // NV12 环形纹理: 每个在飞帧需要独立的转换目标
+      if (nv12Ring_.empty()) {
+        D3D11_TEXTURE2D_DESC desc;
+        ZeroMemory(&desc, sizeof(desc));
+        tex->GetDesc(&desc);
+        desc.Format = DXGI_FORMAT_NV12;
+        desc.MiscFlags = 0;
+        // 槽位 >= 在飞深度 + 2, 池默认 hw_pool_size() (4)
+        int pool = util_encode::hw_pool_size();
+        int need = util_encode::hw_async_depth() + 2;
+        if (pool < need)
+          pool = need;
+        for (int i = 0; i < pool; i++) {
+          ComPtr<ID3D11Texture2D> t;
+          HRI(native_->device_->CreateTexture2D(&desc, NULL,
+                                                t.ReleaseAndGetAddressOf()));
+          nv12Ring_.push_back(t);
+        }
+        LOG_INFO("mfx async pipeline: depth=" +
+                 std::to_string((int)mfxEncParams_.AsyncDepth) +
+                 ", nv12 ring=" + std::to_string(nv12Ring_.size()) +
+                 ", enc surfaces=" + std::to_string(encSurfaces_.size()));
+      }
+      ID3D11Texture2D *slotTex = nv12Ring_[nv12RingPos_].Get();
+      // 槽位仍被在飞帧占用时 (理论上不会发生: 池 >= 在飞+2), 按序阻塞收取
+      while (!pending_.empty() && pending_.front().tex == slotTex) {
+        mfxStatus s = session_.SyncOperation(pending_.front().syncp, 1000);
+        if (s != MFX_ERR_NONE) {
+          LOG_ERROR(std::string("SyncOperation failed, sts=") +
+                    std::to_string((int)s));
+          pending_.pop_front();
+          return -1;
+        }
+        deliver_one(pending_.front(), callback, obj);
+        pending_.pop_front();
+      }
+      if (!native_->BgraToNv12(tex, slotTex, width_, height_, colorSpace_in,
+                               colorSpace_out)) {
+        LOG_ERROR(std::string("failed to convert to NV12"));
+        return -1;
+      }
+      encSurf->Data.MemId = slotTex;
+      nv12RingPos_ = (nv12RingPos_ + 1) % nv12Ring_.size();
+      return encodeOneFrame(encSurf, nEncSurfIdx, callback, obj, ms);
     }
-    if (!native_->BgraToNv12(tex, nv12Texture_.Get(), width_, height_,
-                             colorSpace_in, colorSpace_out)) {
-      LOG_ERROR(std::string("failed to convert to NV12"));
-      return -1;
-    }
-    encSurf->Data.MemId = nv12Texture_.Get();
 #else
     encSurf->Data.MemId = tex;
 #endif
-    return encodeOneFrame(encSurf, callback, obj, ms);
+    return encodeOneFrame(encSurf, -1, callback, obj, ms);
   }
 
   void destroy() {
     if (mfxENC_) {
+      // 等待在飞帧完成 (无 callback, 仅同步以释放 surface), 再 Close
+      while (!pending_.empty()) {
+        session_.SyncOperation(pending_.front().syncp, 1000);
+        pending_.pop_front();
+      }
       //  - It is recommended to close Media SDK components first, before
       //  releasing allocated surfaces, since
       //    some surfaces may still be locked by internal Media SDK resources.
@@ -332,7 +430,9 @@ private:
     mfxEncParams_.IOPattern = MFX_IOPATTERN_IN_VIDEO_MEMORY;
 
     // Configuration for low latency
-    mfxEncParams_.AsyncDepth = 1; // 1 is best for low latency
+    // AsyncDepth=1 时每帧提交后阻塞 SyncOperation; >1 允许 N 帧在飞, 由
+    // encode() 延迟收取实现流水线。HWCODEC_ASYNC_DEPTH=1 可退回同步行为。
+    mfxEncParams_.AsyncDepth = util_encode::hw_async_depth();
     mfxEncParams_.mfx.GopRefDist =
         1; // 1 is best for low latency, I and P frames only
     mfxEncParams_.mfx.GopPicSize = (gop_ > 0 && gop_ < 0xFFFF) ? gop_ : 0xFFFF;
@@ -378,6 +478,7 @@ private:
     sts = mfxENC_->Query(&mfxEncParams_, &mfxEncParams_);
     MSDK_IGNORE_MFX_STS(sts, MFX_WRN_INCOMPATIBLE_VIDEO_PARAM);
     CHECK_STATUS(sts, "Query");
+    async_ = mfxEncParams_.AsyncDepth > 1;
 
     mfxFrameAllocRequest EncRequest;
     memset(&EncRequest, 0, sizeof(EncRequest));
@@ -402,10 +503,23 @@ private:
     CHECK_STATUS(sts, "GetVideoParam");
 
     // Prepare Media SDK bit stream buffer
-    memset(&mfxBS_, 0, sizeof(mfxBS_));
-    mfxBS_.MaxLength = mfxEncParams_.mfx.BufferSizeInKB * 1024;
-    bstData_.resize(mfxBS_.MaxLength);
-    mfxBS_.Data = bstData_.data();
+    if (async_) {
+      // 每个在飞帧独立 bitstream (交付前必须保持有效), 按 enc surface 绑定
+      size_t n = encSurfaces_.size();
+      bsData_.assign(n, {});
+      bsRing_.resize(n);
+      for (size_t i = 0; i < n; i++) {
+        memset(&bsRing_[i], 0, sizeof(mfxBitstream));
+        bsRing_[i].MaxLength = mfxEncParams_.mfx.BufferSizeInKB * 1024;
+        bsData_[i].resize(bsRing_[i].MaxLength);
+        bsRing_[i].Data = bsData_[i].data();
+      }
+    } else {
+      memset(&mfxBS_, 0, sizeof(mfxBS_));
+      mfxBS_.MaxLength = mfxEncParams_.mfx.BufferSizeInKB * 1024;
+      bstData_.resize(mfxBS_.MaxLength);
+      mfxBS_.Data = bstData_.data();
+    }
 
     return MFX_ERR_NONE;
   }
@@ -451,9 +565,86 @@ private:
   }
 #endif
 
-  int encodeOneFrame(mfxFrameSurface1 *in, EncodeCallback callback, void *obj,
-                     int64_t ms) {
+  void deliver_one(const PendingEnc &p, EncodeCallback callback, void *obj) {
+    if (p.bs->DataLength > 0 && callback) {
+      int key = (p.bs->FrameType & MFX_FRAMETYPE_I) ||
+                (p.bs->FrameType & MFX_FRAMETYPE_IDR);
+      callback(p.bs->Data + p.bs->DataOffset, p.bs->DataLength, key, obj,
+               p.ms);
+    }
+  }
+
+  // 非阻塞收取所有已完成的在飞包; 无输出返回 0, 出错返回 -1
+  int deliver_ready(EncodeCallback callback, void *obj) {
+    while (!pending_.empty()) {
+      mfxStatus sts = session_.SyncOperation(pending_.front().syncp, 0);
+      if (sts == MFX_WRN_IN_EXECUTION)
+        break;
+      if (sts != MFX_ERR_NONE) {
+        LOG_ERROR(std::string("SyncOperation failed, sts=") +
+                  std::to_string((int)sts));
+        pending_.pop_front();
+        return -1;
+      }
+      deliver_one(pending_.front(), callback, obj);
+      pending_.pop_front();
+    }
+    return 0;
+  }
+
+  int encodeOneFrame(mfxFrameSurface1 *in, int surfIdx,
+                     EncodeCallback callback, void *obj, int64_t ms) {
     mfxStatus sts = MFX_ERR_NONE;
+
+    if (async_ && surfIdx >= 0) {
+      auto start = util::now();
+      for (;;) {
+        if (util::elapsed_ms(start) > ENCODE_TIMEOUT_MS) {
+          LOG_ERROR(std::string("encode timeout"));
+          return -1;
+        }
+        mfxBitstream &bs = bsRing_[surfIdx];
+        bs.DataLength = 0;
+        bs.DataOffset = 0;
+        bs.TimeStamp = ms * 90; // ms to 90KHZ
+        bs.DecodeTimeStamp = bs.TimeStamp;
+        mfxSyncPoint syncp = NULL;
+        sts = mfxENC_->EncodeFrameAsync(NULL, in, &bs, &syncp);
+        if (MFX_ERR_NONE == sts) {
+          if (!syncp) {
+            LOG_ERROR(std::string(
+                "should not happen, error is none while syncp is null"));
+            return -1;
+          }
+          // 提交即返回, 包由后续 encode() 调用收取 (流水线)
+          pending_.push_back(
+              {syncp, &bs, (ID3D11Texture2D *)in->Data.MemId, ms});
+          return 0;
+        } else if (MFX_WRN_DEVICE_BUSY == sts) {
+          int ret = deliver_ready(callback, obj);
+          if (ret < 0)
+            return ret;
+          if (pending_.empty())
+            Sleep(1); // 理论不会发生, 避免空转
+          continue;
+        } else if (MFX_ERR_NOT_ENOUGH_BUFFER == sts) {
+          LOG_ERROR(std::string("not enough buffer, size=") +
+                    std::to_string(bs.MaxLength));
+          if (bs.MaxLength < 10 * 1024 * 1024) {
+            bs.MaxLength *= 2;
+            bsData_[surfIdx].resize(bs.MaxLength);
+            bs.Data = bsData_[surfIdx].data();
+            continue;
+          }
+          return -1;
+        } else {
+          LOG_ERROR(std::string("EncodeFrameAsync failed, sts=") +
+                    std::to_string((int)sts));
+          return -1;
+        }
+      }
+    }
+
     mfxSyncPoint syncp;
     bool encoded = false;
 
