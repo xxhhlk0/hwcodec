@@ -415,6 +415,11 @@ bool NativeDevice::Process(ID3D11Texture2D *in, ID3D11Texture2D *out, int width,
     if (video_processor_) {
       video_processor_.Reset();
     }
+    // views are created against the enumerator, drop them all with it
+    vp_input_view_.Reset();
+    vp_input_texture_.Reset();
+    vp_input_slice_ = -1;
+    vp_output_views_.clear();
   }
   memcpy(&last_content_desc_, &content_desc, sizeof(content_desc));
 
@@ -447,30 +452,50 @@ bool NativeDevice::Process(ID3D11Texture2D *in, ID3D11Texture2D *out, int width,
   video_context1_->VideoProcessorSetStreamDestRect(video_processor_.Get(), 0,
                                                    true, &rect);
 
-  D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC InputViewDesc;
-  ZeroMemory(&InputViewDesc, sizeof(InputViewDesc));
-  InputViewDesc.FourCC = 0;
-  InputViewDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-  InputViewDesc.Texture2D.MipSlice = 0;
-  InputViewDesc.Texture2D.ArraySlice = arraySlice;
-  ComPtr<ID3D11VideoProcessorInputView> inputView = nullptr;
-  HRB(video_device_->CreateVideoProcessorInputView(
-      in, video_processor_enumerator_.Get(), &InputViewDesc,
-      inputView.ReleaseAndGetAddressOf()));
+  if (!vp_input_view_ || vp_input_texture_.Get() != in ||
+      vp_input_slice_ != arraySlice) {
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC InputViewDesc;
+    ZeroMemory(&InputViewDesc, sizeof(InputViewDesc));
+    InputViewDesc.FourCC = 0;
+    InputViewDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+    InputViewDesc.Texture2D.MipSlice = 0;
+    InputViewDesc.Texture2D.ArraySlice = arraySlice;
+    ComPtr<ID3D11VideoProcessorInputView> inputView = nullptr;
+    HRB(video_device_->CreateVideoProcessorInputView(
+        in, video_processor_enumerator_.Get(), &InputViewDesc,
+        inputView.ReleaseAndGetAddressOf()));
+    vp_input_view_ = inputView;
+    vp_input_texture_ = in;
+    vp_input_slice_ = arraySlice;
+  }
 
-  D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC OutputViewDesc;
-  ZeroMemory(&OutputViewDesc, sizeof(OutputViewDesc));
-  OutputViewDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
-  OutputViewDesc.Texture2D.MipSlice = 0;
   ComPtr<ID3D11VideoProcessorOutputView> outputView = nullptr;
-  video_device_->CreateVideoProcessorOutputView(
-      out, video_processor_enumerator_.Get(), &OutputViewDesc,
-      outputView.ReleaseAndGetAddressOf());
+  for (auto &entry : vp_output_views_) {
+    if (entry.first.Get() == out) {
+      outputView = entry.second;
+      break;
+    }
+  }
+  if (!outputView) {
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC OutputViewDesc;
+    ZeroMemory(&OutputViewDesc, sizeof(OutputViewDesc));
+    OutputViewDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+    OutputViewDesc.Texture2D.MipSlice = 0;
+    HRB(video_device_->CreateVideoProcessorOutputView(
+        out, video_processor_enumerator_.Get(), &OutputViewDesc,
+        outputView.ReleaseAndGetAddressOf()));
+    // the encoder surface ring pool is small, but guard against unbounded
+    // growth anyway (each cached entry keeps a ref on its texture)
+    if (vp_output_views_.size() >= 8) {
+      vp_output_views_.clear();
+    }
+    vp_output_views_.push_back({out, outputView});
+  }
 
   D3D11_VIDEO_PROCESSOR_STREAM StreamData;
   ZeroMemory(&StreamData, sizeof(StreamData));
   StreamData.Enable = TRUE;
-  StreamData.pInputSurface = inputView.Get();
+  StreamData.pInputSurface = vp_input_view_.Get();
   HRB(video_context_->VideoProcessorBlt(video_processor_.Get(),
                                         outputView.Get(), 0, 1, &StreamData));
 

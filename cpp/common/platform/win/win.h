@@ -7,6 +7,8 @@
 #include <directxcolors.h>
 #include <iostream>
 #include <vector>
+#include <utility>
+#include <vector>
 #include <wrl/client.h>
 
 #include "../../common.h"
@@ -82,6 +84,18 @@ public:
   ComPtr<ID3D11VideoProcessorEnumerator> video_processor_enumerator_ = nullptr;
   ComPtr<ID3D11VideoProcessor> video_processor_ = nullptr;
   D3D11_VIDEO_PROCESSOR_CONTENT_DESC last_content_desc_ = {};
+
+  // cached video processor views. CreateVideoProcessorInput/OutputView cost
+  // measurable driver time per frame (x2 at 60+ fps), while the input texture
+  // (desktop duplication surface) and the output textures (encoder surface
+  // ring pool) repeat across frames. Keyed by texture pointer; a ComPtr ref
+  // is held so a cached pointer can never be reused by another resource.
+  ComPtr<ID3D11Texture2D> vp_input_texture_ = nullptr;
+  int vp_input_slice_ = -1;
+  ComPtr<ID3D11VideoProcessorInputView> vp_input_view_ = nullptr;
+  std::vector<std::pair<ComPtr<ID3D11Texture2D>,
+                        ComPtr<ID3D11VideoProcessorOutputView>>>
+      vp_output_views_;
 
   ComPtr<ID3D11RenderTargetView> RTV_ = NULL;
   ComPtr<ID3D11ShaderResourceView> SRV_[2] = {NULL, NULL};
