@@ -28,6 +28,15 @@
 
 namespace {
 
+// Defined before use: MSVC STL requires std::deque<T> to be instantiated with a
+// complete type (libstdc++/libc++ tolerate incomplete types here, MSVC does not).
+struct PendingEnc {
+  mfxSyncPoint syncp;
+  mfxBitstream *bs;
+  ID3D11Texture2D *tex;
+  int64_t ms;
+};
+
 mfxStatus MFX_CDECL simple_getHDL(mfxHDL pthis, mfxMemId mid, mfxHDL *handle) {
   mfxHDLPair *pair = (mfxHDLPair *)handle;
   pair->first = mid;
@@ -66,19 +75,12 @@ public:
   // AsyncDepth>1 时编码在 GPU 上流水线化: 本帧提交后不等待, 包在后续调用中
   // 收取 (输出滞后约一个采集周期, 换取吞吐)。HWCODEC_ASYNC_DEPTH=1 可退回。
   bool async_ = false;
-  std::deque<struct PendingEnc> pending_;
+  std::deque<PendingEnc> pending_;
   std::vector<mfxBitstream> bsRing_;
   std::vector<std::vector<mfxU8>> bsData_;
   // D3D_CONVERT 用的 NV12 环形纹理: 每个在飞帧需要独立的转换目标
   std::vector<ComPtr<ID3D11Texture2D>> nv12Ring_;
   size_t nv12RingPos_ = 0;
-
-  struct PendingEnc {
-    mfxSyncPoint syncp;
-    mfxBitstream *bs;
-    ID3D11Texture2D *tex;
-    int64_t ms;
-  };
 
   mfxExtBuffer *extbuffers_[4] = {NULL, NULL, NULL, NULL};
   mfxExtCodingOption coding_option_;
