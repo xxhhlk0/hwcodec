@@ -33,7 +33,6 @@ namespace {
 struct PendingEnc {
   mfxSyncPoint syncp;
   mfxBitstream *bs;
-  ID3D11Texture2D *tex;
   int64_t ms;
 };
 
@@ -78,9 +77,8 @@ public:
   std::deque<PendingEnc> pending_;
   std::vector<mfxBitstream> bsRing_;
   std::vector<std::vector<mfxU8>> bsData_;
-  // D3D_CONVERT 用的 NV12 环形纹理: 每个在飞帧需要独立的转换目标
+  // D3D_CONVERT 用的 NV12 转换目标, 与 encSurfaces_ 同索引 (每个在飞帧一份)
   std::vector<ComPtr<ID3D11Texture2D>> nv12Ring_;
-  size_t nv12RingPos_ = 0;
 
   mfxExtBuffer *extbuffers_[4] = {NULL, NULL, NULL, NULL};
   mfxExtCodingOption coding_option_;
@@ -152,10 +150,32 @@ public:
     mfxStatus sts = MFX_ERR_NONE;
 
     if (async_) {
-      // 流水线: 先非阻塞收取已完成包, 在飞深度保持 <= AsyncDepth
+      // 流水线: 先非阻塞收取已完成包, 在飞深度保持 <= AsyncDepth - 1
       int ret = deliver_ready(callback, obj);
       if (ret < 0)
         return ret;
+      // 双保险: 不完全依赖 SDK 对 surface->Data.Locked 的回填, 显式限制在飞
+      // 帧数, 否则环形复用的 NV12 目标可能撞上编码器仍在读取的 surface。
+      const size_t max_inflight =
+          mfxEncParams_.AsyncDepth > 1 ? (size_t)(mfxEncParams_.AsyncDepth - 1)
+                                       : (size_t)0;
+      auto wait_start = util::now();
+      while (pending_.size() > max_inflight) {
+        if (util::elapsed_ms(wait_start) > ENCODE_TIMEOUT_MS) {
+          LOG_ERROR(std::string("in-flight encode wait timeout"));
+          return -1;
+        }
+        mfxStatus s = session_.SyncOperation(pending_.front().syncp, 10);
+        if (MFX_ERR_NONE == s) {
+          deliver_one(pending_.front(), callback, obj);
+          pending_.pop_front();
+        } else if (MFX_WRN_IN_EXECUTION != s) {
+          LOG_ERROR(std::string("SyncOperation failed, sts=") +
+                    std::to_string((int)s));
+          pending_.pop_front();
+          return -1;
+        }
+      }
     }
 
     int nEncSurfIdx =
@@ -165,7 +185,7 @@ public:
         LOG_ERROR(std::string("no free enc surface"));
         return -1;
       }
-      // 回压: 在飞帧占满 surface 时收取已完成的再试
+      // 回压: 在飞帧占满 surface 时先收已完成包, 没进展就阻塞等最旧的在飞帧
       auto start = util::now();
       while (nEncSurfIdx >= (int)encSurfaces_.size()) {
         if (util::elapsed_ms(start) > ENCODE_TIMEOUT_MS) {
@@ -175,8 +195,21 @@ public:
         int ret = deliver_ready(callback, obj);
         if (ret < 0)
           return ret;
-        if (pending_.empty())
+        if (pending_.empty()) {
           Sleep(1);
+        } else {
+          // 非阻塞收取没进展 (包还没好): 用短超时阻塞等最旧的一个, 避免空转
+          mfxStatus s = session_.SyncOperation(pending_.front().syncp, 10);
+          if (MFX_ERR_NONE == s) {
+            deliver_one(pending_.front(), callback, obj);
+            pending_.pop_front();
+          } else if (MFX_WRN_IN_EXECUTION != s) {
+            LOG_ERROR(std::string("SyncOperation failed, sts=") +
+                      std::to_string((int)s));
+            pending_.pop_front();
+            return -1;
+          }
+        }
         nEncSurfIdx =
             GetFreeSurfaceIndex(encSurfaces_.data(), encSurfaces_.size());
       }
@@ -224,49 +257,37 @@ public:
       }
       encSurf->Data.MemId = nv12Texture_.Get();
     } else {
-      // NV12 环形纹理: 每个在飞帧需要独立的转换目标
+      // NV12 转换目标与 enc surface 一一对应: GetFreeSurfaceIndex 只返回未被
+      // SDK 锁定的 surface, 所以同索引的 NV12 纹理必然可以安全覆写。
+      // (不能用"上次用到哪"的环形游标: MFX_ERR_MORE_DATA 的帧没有 sync point,
+      //  游标可能覆写编码器仍在读取的纹理, 而 surface 的 Locked 标志是权威的。)
       if (nv12Ring_.empty()) {
         D3D11_TEXTURE2D_DESC desc;
         ZeroMemory(&desc, sizeof(desc));
         tex->GetDesc(&desc);
         desc.Format = DXGI_FORMAT_NV12;
         desc.MiscFlags = 0;
-        // 槽位 >= 在飞深度 + 2, 池默认 hw_pool_size() (4)
-        int pool = util_encode::hw_pool_size();
-        int need = util_encode::hw_async_depth() + 2;
-        if (pool < need)
-          pool = need;
-        for (int i = 0; i < pool; i++) {
-          ComPtr<ID3D11Texture2D> t;
-          HRI(native_->device_->CreateTexture2D(&desc, NULL,
-                                                t.ReleaseAndGetAddressOf()));
-          nv12Ring_.push_back(t);
+        nv12Ring_.resize(encSurfaces_.size());
+        for (size_t i = 0; i < nv12Ring_.size(); i++) {
+          HRI(native_->device_->CreateTexture2D(
+              &desc, NULL, nv12Ring_[i].ReleaseAndGetAddressOf()));
         }
         LOG_INFO("mfx async pipeline: depth=" +
                  std::to_string((int)mfxEncParams_.AsyncDepth) +
                  ", nv12 ring=" + std::to_string(nv12Ring_.size()) +
                  ", enc surfaces=" + std::to_string(encSurfaces_.size()));
       }
-      ID3D11Texture2D *slotTex = nv12Ring_[nv12RingPos_].Get();
-      // 槽位仍被在飞帧占用时 (理论上不会发生: 池 >= 在飞+2), 按序阻塞收取
-      while (!pending_.empty() && pending_.front().tex == slotTex) {
-        mfxStatus s = session_.SyncOperation(pending_.front().syncp, 1000);
-        if (s != MFX_ERR_NONE) {
-          LOG_ERROR(std::string("SyncOperation failed, sts=") +
-                    std::to_string((int)s));
-          pending_.pop_front();
-          return -1;
-        }
-        deliver_one(pending_.front(), callback, obj);
-        pending_.pop_front();
+      if ((size_t)nEncSurfIdx >= nv12Ring_.size()) {
+        LOG_ERROR(std::string("nv12 ring smaller than enc surfaces"));
+        return -1;
       }
+      ID3D11Texture2D *slotTex = nv12Ring_[nEncSurfIdx].Get();
       if (!native_->BgraToNv12(tex, slotTex, width_, height_, colorSpace_in,
                                colorSpace_out)) {
         LOG_ERROR(std::string("failed to convert to NV12"));
         return -1;
       }
       encSurf->Data.MemId = slotTex;
-      nv12RingPos_ = (nv12RingPos_ + 1) % nv12Ring_.size();
       return encodeOneFrame(encSurf, nEncSurfIdx, callback, obj, ms);
     }
 #else
@@ -275,13 +296,23 @@ public:
     return encodeOneFrame(encSurf, -1, callback, obj, ms);
   }
 
+  // 等待所有在飞帧完成并丢弃其输出: 供 Reset/Close 等要求"静止"的操作使用
+  // (带在飞帧时调用 MFXVideoENCODE::Reset 是未定义行为)。
+  void drain_pending() {
+    while (!pending_.empty()) {
+      mfxStatus s = session_.SyncOperation(pending_.front().syncp, 1000);
+      if (MFX_ERR_NONE != s && MFX_WRN_IN_EXECUTION != s) {
+        LOG_ERROR(std::string("SyncOperation failed during drain, sts=") +
+                  std::to_string((int)s));
+      }
+      pending_.pop_front();
+    }
+  }
+
   void destroy() {
     if (mfxENC_) {
       // 等待在飞帧完成 (无 callback, 仅同步以释放 surface), 再 Close
-      while (!pending_.empty()) {
-        session_.SyncOperation(pending_.front().syncp, 1000);
-        pending_.pop_front();
-      }
+      drain_pending();
       //  - It is recommended to close Media SDK components first, before
       //  releasing allocated surfaces, since
       //    some surfaces may still be locked by internal Media SDK resources.
@@ -619,8 +650,14 @@ private:
             return -1;
           }
           // 提交即返回, 包由后续 encode() 调用收取 (流水线)
-          pending_.push_back(
-              {syncp, &bs, (ID3D11Texture2D *)in->Data.MemId, ms});
+          pending_.push_back({syncp, &bs, ms});
+          return 0;
+        } else if (MFX_ERR_MORE_DATA == sts) {
+          // AsyncDepth>1 时编码器要先攒够输入才吐第一个包, 首帧/次帧会返回
+          // MFX_ERR_MORE_DATA 且不返回 sync point。这不是错误: 当致命错误处理
+          // 会让硬件编码器探测直接失败, 把配置写成 vram_encode=[] 从而禁用
+          // VRAM 硬编 (实测: depth=2 时所有 Intel 适配器都被误判为不可用)。
+          // 该帧由 SDK 内部持有或丢弃, surface 是否被占用由 Locked 标志决定。
           return 0;
         } else if (MFX_WRN_DEVICE_BUSY == sts) {
           int ret = deliver_ready(callback, obj);
@@ -869,8 +906,22 @@ int mfx_test_encode(int64_t *outLuids, int32_t *outVendors, int32_t maxDescNum, 
         e->native_->next();
         int32_t key_obj = 0;
         auto start = util::now();
-        bool succ = mfx_encode(e, e->native_->GetCurrentTexture(), util_encode::vram_encode_test_callback, &key_obj,
-                       0) == 0 && key_obj == 1;
+        bool succ = false;
+        // AsyncDepth>1 时首个包要等编码器攒够输入才产出 (最初几帧返回
+        // MFX_ERR_MORE_DATA 且无 sync point)。只提交一帧会把可用的 Intel
+        // 编码器误判为不可用, 把配置写成 vram_encode=[], 等于禁用 VRAM 硬编。
+        for (int attempt = 0; attempt < 8; attempt++) {
+          if (util::elapsed_ms(start) >= TEST_TIMEOUT_MS)
+            break;
+          if (mfx_encode(e, e->native_->GetCurrentTexture(),
+                         util_encode::vram_encode_test_callback, &key_obj,
+                         0) != 0)
+            break;
+          if (key_obj == 1) {
+            succ = true;
+            break;
+          }
+        }
         int64_t elapsed = util::elapsed_ms(start);
         if (succ && elapsed < TEST_TIMEOUT_MS) {
           outLuids[count] = currentLuid;
@@ -904,6 +955,8 @@ int mfx_set_bitrate(void *encoder, int32_t kbs) {
     mfxStatus sts = MFX_ERR_NONE;
     // https://github.com/GStreamer/gstreamer/blob/e19428a802c2f4ee9773818aeb0833f93509a1c0/subprojects/gst-plugins-bad/sys/qsv/gstqsvencoder.cpp#L1312
     p->kbs_ = kbs;
+    // 异步流水线: Reset 前必须等所有在飞帧完成 (带在飞帧 Reset 是未定义行为)
+    p->drain_pending();
     p->mfxENC_->GetVideoParam(&p->mfxEncParams_);
     p->mfxEncParams_.mfx.TargetKbps = kbs;
     p->mfxEncParams_.mfx.MaxKbps = kbs;
