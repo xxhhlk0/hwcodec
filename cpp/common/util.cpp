@@ -92,7 +92,7 @@ static int hw_env_int(const char *key, int fallback) {
 // qsv/vaapi 的硬件编码流水线深度。上游为"最低延迟"写死 1, 代价是 iGPU
 // 无法重叠 "取帧-编码-回读", 吞吐腰斩 (Intel UHD 750 @2560x1440 实测见下)。
 // HWCODEC_ASYNC_DEPTH=1 可退回上游行为。
-int hw_async_depth() { return hw_env_int("HWCODEC_ASYNC_DEPTH", 2); }
+int hw_async_depth() { return hw_env_int("HWCODEC_ASYNC_DEPTH", 1); }
 
 // 硬件帧池大小。池里只有 1 个 surface 时, "下一帧写入" 必须等 "上一帧编码完",
 // async_depth > 1 的流水线完全无从谈起。默认 4: 足够 QSV 深度 2 的流水线
