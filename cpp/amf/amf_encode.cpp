@@ -44,28 +44,19 @@ amf_int64 amf_usage(int usage) {
   }
 }
 
-// AMF 只有 4 档画质预设, 把 preset 1..7 就近折进去 (1 最快, 7 画质最好)
+// AMF 只有 3 档画质预设, 把 preset 1..7 就近折进去 (1 最快, 7 画质最好)
 amf_int64 amf_quality_preset(int preset, bool hevc) {
-  static const amf_int64 avc_presets[] = {
-      AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED,
-      AMF_VIDEO_ENCODER_QUALITY_PRESET_BALANCED,
-      AMF_VIDEO_ENCODER_QUALITY_PRESET_BALANCED,
-      AMF_VIDEO_ENCODER_QUALITY_PRESET_QUALITY,
-      AMF_VIDEO_ENCODER_QUALITY_PRESET_QUALITY,
-      AMF_VIDEO_ENCODER_QUALITY_PRESET_HIGH_QUALITY,
-      AMF_VIDEO_ENCODER_QUALITY_PRESET_HIGH_QUALITY,
-  };
-  static const amf_int64 hevc_presets[] = {
-      AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_SPEED,
-      AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_BALANCED,
-      AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_BALANCED,
-      AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_QUALITY,
-      AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_QUALITY,
-      AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_HIGH_QUALITY,
-      AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_HIGH_QUALITY,
-  };
-  if (preset >= 1 && preset <= 7) {
-    return hevc ? hevc_presets[preset - 1] : avc_presets[preset - 1];
+  if (preset <= 0 || preset > 7) {
+    return hevc ? AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_QUALITY
+                : AMF_VIDEO_ENCODER_QUALITY_PRESET_QUALITY;
+  }
+  if (preset <= 2) {
+    return hevc ? AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_SPEED
+                : AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED;
+  }
+  if (preset <= 5) {
+    return hevc ? AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_BALANCED
+                : AMF_VIDEO_ENCODER_QUALITY_PRESET_BALANCED;
   }
   return hevc ? AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_QUALITY
               : AMF_VIDEO_ENCODER_QUALITY_PRESET_QUALITY;
