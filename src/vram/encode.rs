@@ -33,6 +33,7 @@ impl Encoder {
             FFMPEG => ffmpeg::encode_calls(),
         };
         unsafe {
+            let opts = std::ffi::CString::new(ctx.d.opts.as_str()).unwrap_or_default();
             let codec = (calls.new)(
                 ctx.d.device.unwrap_or(std::ptr::null_mut()),
                 ctx.f.luid,
@@ -49,6 +50,7 @@ impl Encoder {
                 ctx.d.temporal_aq as c_int,
                 ctx.d.multipass,
                 ctx.d.preanalysis as c_int,
+                opts.as_ptr(),
             );
             if codec.is_null() {
                 return Err(());
@@ -170,7 +172,7 @@ pub fn available(d: DynamicContext) -> Vec<FeatureContext> {
                 data_format: n.format,
                 luid: 0,
             },
-            d,
+            d: d.clone(),
         })
         .collect();
 

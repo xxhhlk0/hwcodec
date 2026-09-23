@@ -57,6 +57,18 @@ void free_driver(CudaFunctions **pp_cuda_dl, NvencFunctions **pp_nvenc_dl) {
   }
 }
 
+const GUID *nvenc_preset_guid(int preset) {
+  static const GUID presets[] = {
+      NV_ENC_PRESET_P1_GUID, NV_ENC_PRESET_P2_GUID, NV_ENC_PRESET_P3_GUID,
+      NV_ENC_PRESET_P4_GUID, NV_ENC_PRESET_P5_GUID, NV_ENC_PRESET_P6_GUID,
+      NV_ENC_PRESET_P7_GUID,
+  };
+  if (preset >= 1 && preset <= 7) {
+    return &presets[preset - 1];
+  }
+  return NULL;
+}
+
 class NvencEncoder {
 public:
   std::unique_ptr<NativeDevice> native_ = nullptr;
@@ -72,13 +84,14 @@ public:
   int32_t kbs_;
   int32_t framerate_;
   int32_t gop_;
+  std::string opts_;
   bool full_range_ = false;
   bool bt709_ = false;
   NV_ENC_CONFIG encodeConfig_ = {0};
 
   NvencEncoder(void *handle, int64_t luid, DataFormat dataFormat,
                int32_t width, int32_t height, int32_t kbs, int32_t framerate,
-               int32_t gop) {
+               int32_t gop, const char *opts) {
     handle_ = handle;
     luid_ = luid;
     dataFormat_ = dataFormat;
@@ -87,6 +100,7 @@ public:
     kbs_ = kbs;
     framerate_ = framerate;
     gop_ = gop;
+    opts_ = opts ? opts : "";
 
     load_driver(&cuda_dl_, &nvenc_dl_);
   }
@@ -137,10 +151,21 @@ public:
     ZeroMemory(&initializeParams, sizeof(initializeParams));
     ZeroMemory(&encodeConfig_, sizeof(encodeConfig_));
     initializeParams.encodeConfig = &encodeConfig_;
+    auto opts = util_encode::parse_opts(opts_.c_str());
+    const int preset = util_encode::opt_int(opts, "preset", 0);
+    const GUID *presetGuid = nvenc_preset_guid(preset);
+    const int tuning = util_encode::opt_int(opts, "tuning", 0);
+    NV_ENC_TUNING_INFO tuningInfo = NV_ENC_TUNING_INFO_LOW_LATENCY;
+    if (tuning == 1) {
+      tuningInfo = NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
+    } else if (tuning == 3) {
+      tuningInfo = NV_ENC_TUNING_INFO_HIGH_QUALITY;
+    }
     pEnc_->CreateDefaultEncoderParams(
         &initializeParams, guidCodec,
-        NV_ENC_PRESET_P3_GUID /*NV_ENC_PRESET_LOW_LATENCY_HP_GUID*/,
-        NV_ENC_TUNING_INFO_LOW_LATENCY);
+        presetGuid ? *presetGuid
+                   : NV_ENC_PRESET_P3_GUID /*NV_ENC_PRESET_LOW_LATENCY_HP_GUID*/,
+        tuningInfo);
 
     // no delay
     initializeParams.encodeConfig->frameIntervalP = 1;
@@ -155,14 +180,82 @@ public:
     initializeParams.encodeConfig->gopLength =
         (gop_ > 0 && gop_ < MAX_GOP) ? gop_ : NVENC_INFINITE_GOPLENGTH;
     // rc method
-    initializeParams.encodeConfig->rcParams.rateControlMode =
-        NV_ENC_PARAMS_RC_CBR;
+    NV_ENC_RC_PARAMS &rcParams = initializeParams.encodeConfig->rcParams;
+    const int q = util_encode::opt_int(opts, "q", -1);
+    switch (util_encode::opt_int(opts, "rc", 0)) {
+    case 1:
+      rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
+      break;
+    case 2:
+      rcParams.rateControlMode = NV_ENC_PARAMS_RC_VBR;
+      break;
+    case 3:
+      // q 越界时不切 CONSTQP, 避免把全 0 的 QP 交给驱动 (等于近乎无损的码率)
+      if (q >= 0 && q <= 51) {
+        rcParams.rateControlMode = NV_ENC_PARAMS_RC_CONSTQP;
+        rcParams.constQP.qpIntra = (uint32_t)q;
+        rcParams.constQP.qpInterP = (uint32_t)q;
+        rcParams.constQP.qpInterB = (uint32_t)q;
+      } else {
+        rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
+      }
+      break;
+    default:
+      rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
+      break;
+    }
+    if (util_encode::has_opt(opts, "target_quality")) {
+      const int tq = util_encode::opt_int(opts, "target_quality", 0);
+      if (tq >= 0 && tq <= 51) {
+        rcParams.targetQuality = (uint8_t)tq;
+      }
+    }
+    if (util_encode::has_opt(opts, "spatial_aq")) {
+      rcParams.enableAQ = util_encode::opt_flag(opts, "spatial_aq", false) ? 1 : 0;
+    }
+    if (util_encode::has_opt(opts, "temporal_aq")) {
+      rcParams.enableTemporalAQ =
+          util_encode::opt_flag(opts, "temporal_aq", false) ? 1 : 0;
+    }
+    if (util_encode::has_opt(opts, "multipass")) {
+      const int multipass = util_encode::opt_int(opts, "multipass", 0);
+      if (multipass == 1 || multipass == 2) {
+        rcParams.multiPass = multipass == 2
+                                 ? NV_ENC_TWO_PASS_FULL_RESOLUTION
+                                 : NV_ENC_TWO_PASS_QUARTER_RESOLUTION;
+      } else {
+        rcParams.multiPass = NV_ENC_MULTI_PASS_DISABLED;
+      }
+    }
+    if (util_encode::has_opt(opts, "lookahead_depth")) {
+      const int depth = util_encode::opt_int(opts, "lookahead_depth", 0);
+      if (depth > 0) {
+        rcParams.enableLookahead = 1;
+        rcParams.lookaheadDepth = (uint16_t)depth;
+      }
+    }
+    const int num_ref_frame = util_encode::opt_int(opts, "num_ref_frame", 0);
     // color
     if (dataFormat_ == H264) {
-      setup_h264(initializeParams.encodeConfig);
+      setup_h264(initializeParams.encodeConfig, num_ref_frame);
     } else {
-      setup_hevc(initializeParams.encodeConfig);
+      setup_hevc(initializeParams.encodeConfig, num_ref_frame);
     }
+
+    LOG_INFO("nvenc encode params: preset=" + std::to_string(preset) +
+             ", tuning=" + std::to_string(tuningInfo) +
+             ", rc=" + std::to_string(rcParams.rateControlMode) +
+             ", q=" + std::to_string(q) + ", target_quality=" +
+             std::to_string(rcParams.targetQuality) + ", kbs=" +
+             std::to_string(kbs_) + ", gop=" +
+             std::to_string(initializeParams.encodeConfig->gopLength) +
+             ", frame_interval_p=" +
+             std::to_string(initializeParams.encodeConfig->frameIntervalP) +
+             ", spatial_aq=" + std::to_string(rcParams.enableAQ) +
+             ", temporal_aq=" + std::to_string(rcParams.enableTemporalAQ) +
+             ", multipass=" + std::to_string(rcParams.multiPass) +
+             ", lookahead_depth=" + std::to_string(rcParams.lookaheadDepth) +
+             ", num_ref_frame=" + std::to_string(num_ref_frame));
 
     pEnc_->CreateEncoder(&initializeParams);
     return true;
@@ -211,7 +304,7 @@ public:
     free_driver(&cuda_dl_, &nvenc_dl_);
   }
 
-  void setup_h264(NV_ENC_CONFIG *encodeConfig) {
+  void setup_h264(NV_ENC_CONFIG *encodeConfig, int num_ref_frame) {
     NV_ENC_CODEC_CONFIG *encodeCodecConfig = &encodeConfig->encodeCodecConfig;
     NV_ENC_CONFIG_H264 *h264 = &encodeCodecConfig->h264Config;
     NV_ENC_CONFIG_H264_VUI_PARAMETERS *vui = &h264->h264VUIParameters;
@@ -230,11 +323,14 @@ public:
     // yuv444 input
     h264->chromaFormatIDC = 1;
     h264->level = NV_ENC_LEVEL_AUTOSELECT;
+    if (num_ref_frame > 0) {
+      h264->maxNumRefFrames = (uint32_t)num_ref_frame;
+    }
 
     encodeConfig->profileGUID = NV_ENC_H264_PROFILE_MAIN_GUID;
   }
 
-  void setup_hevc(NV_ENC_CONFIG *encodeConfig) {
+  void setup_hevc(NV_ENC_CONFIG *encodeConfig, int num_ref_frame) {
     NV_ENC_CODEC_CONFIG *encodeCodecConfig = &encodeConfig->encodeCodecConfig;
     NV_ENC_CONFIG_HEVC *hevc = &encodeCodecConfig->hevcConfig;
     NV_ENC_CONFIG_HEVC_VUI_PARAMETERS *vui = &hevc->hevcVUIParameters;
@@ -255,6 +351,9 @@ public:
     hevc->level = NV_ENC_LEVEL_AUTOSELECT;
     hevc->outputPictureTimingSEI = 1;
     hevc->tier = NV_ENC_TIER_HEVC_MAIN;
+    if (num_ref_frame > 0) {
+      hevc->maxNumRefFramesInDPB = (uint32_t)num_ref_frame;
+    }
 
     encodeConfig->profileGUID = NV_ENC_HEVC_PROFILE_MAIN_GUID;
   }
@@ -340,14 +439,16 @@ void *nv_new_encoder(void *handle, int64_t luid, DataFormat dataFormat,
                      int32_t width, int32_t height, int32_t kbs,
                      int32_t framerate, int32_t gop,
                      int quality, int rc, int q, int spatial_aq,
-                     int temporal_aq, int multipass, int preanalysis) {
-  // native NVENC path does not consume the ffmpeg-style encode profile args yet
+                     int temporal_aq, int multipass, int preanalysis,
+                     const char *opts) {
+  // native NVENC path does not consume the ffmpeg-style encode profile args,
+  // it reads the vendor options from opts instead
   (void)quality; (void)rc; (void)q; (void)spatial_aq; (void)temporal_aq;
   (void)multipass; (void)preanalysis;
   NvencEncoder *e = NULL;
   try {
     e = new NvencEncoder(handle, luid, dataFormat, width, height, kbs,
-                         framerate, gop);
+                         framerate, gop, opts);
     if (!e->init()) {
       goto _exit;
     }
@@ -412,7 +513,7 @@ int nv_test_encode(int64_t *outLuids, int32_t *outVendors, int32_t maxDescNum, i
       NvencEncoder *e = (NvencEncoder *)nv_new_encoder(
           (void *)adapter.get()->device_.Get(), currentLuid,
           dataFormat, width, height, kbs, framerate, gop,
-          Quality_Default, RC_CBR, -1, 0, 0, 0, 0);
+          Quality_Default, RC_CBR, -1, 0, 0, 0, 0, NULL);
       if (!e)
         continue;
       if (e->native_->EnsureTexture(e->width_, e->height_)) {

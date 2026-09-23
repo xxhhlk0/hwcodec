@@ -1,5 +1,5 @@
 use crate::common::{DataFormat, DecodeCallback, EncodeCallback};
-use std::os::raw::{c_int, c_void};
+use std::os::raw::{c_char, c_int, c_void};
 
 pub type NewEncoderCall = unsafe extern "C" fn(
     hdl: *mut c_void,
@@ -17,6 +17,7 @@ pub type NewEncoderCall = unsafe extern "C" fn(
     temporal_aq: c_int,
     multipass: c_int,
     preanalysis: c_int,
+    opts: *const c_char,
 ) -> *mut c_void;
 
 pub type EncodeCall = unsafe extern "C" fn(

@@ -56,6 +56,40 @@ public:
   AVPixelFormat sw_pixfmt_;
 };
 
+// preset 1..7 (1 最快, 7 画质最好) 映射到 ffmpeg 各编码器的预设名, 比
+// Quality 枚举的 3 档更细; 编码器没有预设概念时返回 false。
+bool apply_preset(void *priv_data, const std::string &name, int preset) {
+  if (preset < 1 || preset > 7) {
+    return false;
+  }
+  static const char *nvenc_presets[] = {"p1", "p2", "p3",     "p4",
+                                        "p5", "p6", "p7"};
+  static const char *qsv_presets[] = {"veryfast", "faster", "fast", "medium",
+                                      "slow",     "slower", "veryslow"};
+  static const char *amf_presets[] = {"speed",    "balanced", "balanced",
+                                      "balanced", "quality",  "quality",
+                                      "quality"};
+  const char *opt = "preset";
+  const char *value = NULL;
+  if (name.find("nvenc") != std::string::npos) {
+    value = nvenc_presets[preset - 1];
+  } else if (name.find("qsv") != std::string::npos) {
+    value = qsv_presets[preset - 1];
+  } else if (name.find("amf") != std::string::npos) {
+    opt = "quality";
+    value = amf_presets[preset - 1];
+  } else {
+    return false;
+  }
+  int ret = av_opt_set(priv_data, opt, value, 0);
+  if (ret < 0) {
+    LOG_ERROR(std::string("set ") + opt + " " + value +
+              " failed, ret = " + av_err2str(ret));
+    return false;
+  }
+  return true;
+}
+
 class FFmpegVRamEncoder {
 public:
   AVCodecContext *c_ = NULL;
@@ -89,6 +123,7 @@ public:
   int temporal_aq_;
   int multipass_;
   int preanalysis_;
+  std::string opts_;
   bool enhance_applied_ = false;
   // 是否下发过 qsv 的 low_power/low_delay_brc (avcodec_open2 失败时据此回退重试)
   bool qsv_low_latency_applied_ = false;
@@ -100,7 +135,7 @@ public:
                     int32_t width, int32_t height, int32_t kbs,
                     int32_t framerate, int32_t gop, int quality, int rc,
                     int q, int spatial_aq, int temporal_aq, int multipass,
-                    int preanalysis) {
+                    int preanalysis, const char *opts) {
     handle_ = handle;
     luid_ = luid;
     dataFormat_ = dataFormat;
@@ -116,6 +151,7 @@ public:
     temporal_aq_ = temporal_aq;
     multipass_ = multipass;
     preanalysis_ = preanalysis;
+    opts_ = opts ? opts : "";
   }
 
   ~FFmpegVRamEncoder() {}
@@ -161,6 +197,29 @@ public:
     // qsv: low_power + low_delay_brc (吞吐相关; 老核显不支持时由下方 open 回退)
     qsv_low_latency_applied_ =
         util_encode::apply_qsv_low_latency(c_->priv_data, encoder_->name_);
+    auto opts = util_encode::parse_opts(opts_.c_str());
+    if (encoder_->name_.find("qsv") != std::string::npos) {
+      if (util_encode::has_opt(opts, "low_power")) {
+        const int v = util_encode::opt_flag(opts, "low_power", true) ? 1 : 0;
+        av_opt_set_int(c_->priv_data, "low_power", v, 0);
+        qsv_low_latency_applied_ = qsv_low_latency_applied_ || v == 1;
+      }
+      if (util_encode::has_opt(opts, "low_delay_brc")) {
+        const int v = util_encode::opt_flag(opts, "low_delay_brc", true) ? 1 : 0;
+        av_opt_set_int(c_->priv_data, "low_delay_brc", v, 0);
+        qsv_low_latency_applied_ = qsv_low_latency_applied_ || v == 1;
+      }
+      if (util_encode::has_opt(opts, "async_depth")) {
+        const int depth = util_encode::opt_int(opts, "async_depth", 0);
+        if (depth > 0) {
+          av_opt_set_int(c_->priv_data, "async_depth", depth, 0);
+        }
+      }
+      if (util_encode::has_opt(opts, "cavlc")) {
+        av_opt_set_int(c_->priv_data, "cavlc",
+                       util_encode::opt_flag(opts, "cavlc", false) ? 1 : 0, 0);
+      }
+    }
     // preset/quality: previously commented out (Quality_Default is a no-op), so the
     // encode profile preset had no effect on the vram path. Same mapping as the RAM path.
     if (!util_encode::set_quality(c_->priv_data, encoder_->name_, quality_)) {
@@ -168,6 +227,8 @@ public:
       LOG_ERROR(std::string("set_quality failed, keep the default preset, name: ") +
                 encoder_->name_);
     }
+    apply_preset(c_->priv_data, encoder_->name_,
+                 util_encode::opt_int(opts, "preset", 0));
     // rc: RC_DEFAULT (no profile) keeps the legacy behaviour of this path (CBR)
     util_encode::set_rate_control(c_, encoder_->name_,
                                   rc_ == RC_DEFAULT ? RC_CBR : (RateControl)rc_,
@@ -182,8 +243,9 @@ public:
     // 与 RAM 通道一致: 打印请求参数 + open 后 ffmpeg 实际选定的码控字段,
     // 便于确认 rc/preset/QP 是否真的生效 (qsv + rc=CQ -> ICQ, global_quality = q)
     LOG_INFO("hw encode params: name=" + encoder_->name_ +
-             ", quality=" + std::to_string(quality_) + ", rc=" +
-             std::to_string(rc_) + ", q=" + std::to_string(q_) +
+             ", quality=" + std::to_string(quality_) + ", preset=" +
+             std::to_string(util_encode::opt_int(opts, "preset", 0)) +
+             ", rc=" + std::to_string(rc_) + ", q=" + std::to_string(q_) +
              ", kbs=" + std::to_string(kbs_) + ", fps=" +
              std::to_string(framerate_) + ", gop=" + std::to_string(gop_) +
              ", bit_rate=" + std::to_string(c_->bit_rate) +
@@ -552,13 +614,14 @@ FFmpegVRamEncoder *ffmpeg_vram_new_encoder(void *handle, int64_t luid,
                                            int32_t framerate, int32_t gop,
                                            int quality, int rc, int q,
                                            int spatial_aq, int temporal_aq,
-                                           int multipass, int preanalysis) {
+                                           int multipass, int preanalysis,
+                                           const char *opts) {
   FFmpegVRamEncoder *encoder = NULL;
   try {
     encoder = new FFmpegVRamEncoder(handle, luid, dataFormat, width,
                                     height, kbs, framerate, gop, quality, rc,
                                     q, spatial_aq, temporal_aq, multipass,
-                                    preanalysis);
+                                    preanalysis, opts);
     if (encoder) {
       if (encoder->init()) {
         return encoder;
@@ -645,7 +708,7 @@ int ffmpeg_vram_test_encode(int64_t *outLuids, int32_t *outVendors, int32_t maxD
         FFmpegVRamEncoder *e = (FFmpegVRamEncoder *)ffmpeg_vram_new_encoder(
             (void *)adapter.get()->device_.Get(), currentLuid,
             dataFormat, width, height, kbs, framerate, gop,
-            Quality_Default, RC_CBR, -1, 0, 0, 0, 0);
+            Quality_Default, RC_CBR, -1, 0, 0, 0, 0, NULL);
         if (!e)
           continue;
         if (e->native_->EnsureTexture(e->width_, e->height_)) {

@@ -10,7 +10,8 @@ void *mfx_new_encoder(void *handle, int64_t luid,
                       int32_t dataFormat, int32_t width, int32_t height,
                       int32_t kbs, int32_t framerate, int32_t gop,
                       int quality, int rc, int q, int spatial_aq,
-                      int temporal_aq, int multipass, int preanalysis);
+                      int temporal_aq, int multipass, int preanalysis,
+                      const char *opts);
 
 int mfx_encode(void *encoder, void *tex, EncodeCallback callback, void *obj,
                int64_t ms);

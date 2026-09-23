@@ -31,6 +31,46 @@ namespace {
     return res;                                                                \
   }
 
+amf_int64 amf_usage(int usage) {
+  switch (usage) {
+  case 1:
+    return AMF_VIDEO_ENCODER_USAGE_ULTRA_LOW_LATENCY;
+  case 2:
+    return AMF_VIDEO_ENCODER_USAGE_LOW_LATENCY;
+  case 4:
+    return AMF_VIDEO_ENCODER_USAGE_HIGH_QUALITY;
+  default:
+    return AMF_VIDEO_ENCODER_USAGE_LOW_LATENCY_HIGH_QUALITY;
+  }
+}
+
+// AMF 只有 4 档画质预设, 把 preset 1..7 就近折进去 (1 最快, 7 画质最好)
+amf_int64 amf_quality_preset(int preset, bool hevc) {
+  static const amf_int64 avc_presets[] = {
+      AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED,
+      AMF_VIDEO_ENCODER_QUALITY_PRESET_BALANCED,
+      AMF_VIDEO_ENCODER_QUALITY_PRESET_BALANCED,
+      AMF_VIDEO_ENCODER_QUALITY_PRESET_QUALITY,
+      AMF_VIDEO_ENCODER_QUALITY_PRESET_QUALITY,
+      AMF_VIDEO_ENCODER_QUALITY_PRESET_HIGH_QUALITY,
+      AMF_VIDEO_ENCODER_QUALITY_PRESET_HIGH_QUALITY,
+  };
+  static const amf_int64 hevc_presets[] = {
+      AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_SPEED,
+      AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_BALANCED,
+      AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_BALANCED,
+      AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_QUALITY,
+      AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_QUALITY,
+      AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_HIGH_QUALITY,
+      AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_HIGH_QUALITY,
+  };
+  if (preset >= 1 && preset <= 7) {
+    return hevc ? hevc_presets[preset - 1] : avc_presets[preset - 1];
+  }
+  return hevc ? AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_QUALITY
+              : AMF_VIDEO_ENCODER_QUALITY_PRESET_QUALITY;
+}
+
 /** Encoder output packet */
 struct encoder_packet {
   uint8_t *data; /**< Packet data */
@@ -79,6 +119,7 @@ private:
   bool enable4K_ = false;
   bool full_range_ = false;
   bool bt709_ = false;
+  std::string opts_;
 
   // Buffers
   std::vector<uint8_t> packetDataBuffer_;
@@ -86,7 +127,8 @@ private:
 public:
   AMFEncoder(void *handle, amf::AMF_MEMORY_TYPE memoryType, amf_wstring codec,
              DataFormat dataFormat, int32_t width, int32_t height,
-             int32_t bitrate, int32_t framerate, int32_t gop) {
+             int32_t bitrate, int32_t framerate, int32_t gop,
+             const char *opts) {
     handle_ = handle;
     dataFormat_ = dataFormat;
     AMFMemoryType_ = memoryType;
@@ -96,6 +138,7 @@ public:
     frameRate_ = framerate;
     gop_ = (gop > 0 && gop < MAX_GOP) ? gop : MAX_GOP;
     enable4K_ = width > 1920 && height > 1080;
+    opts_ = opts ? opts : "";
   }
 
   ~AMFEncoder() {}
@@ -233,11 +276,16 @@ public:
 private:
   AMF_RESULT SetParams(const amf_wstring &codecStr) {
     AMF_RESULT res;
+    const bool hevc = codecStr == amf_wstring(AMFVideoEncoder_HEVC);
+    auto opts = util_encode::parse_opts(opts_.c_str());
+    const int usage = util_encode::opt_int(opts, "usage", 0);
+    const int preset = util_encode::opt_int(opts, "preset", 0);
+    const int rc = util_encode::opt_int(opts, "rc", 0);
+    const int q = util_encode::opt_int(opts, "q", -1);
+    const int num_ref_frame = util_encode::opt_int(opts, "num_ref_frame", 0);
     if (codecStr == amf_wstring(AMFVideoEncoderVCE_AVC)) {
       // ------------- Encoder params usage---------------
-      res = AMFEncoder_->SetProperty(
-          AMF_VIDEO_ENCODER_USAGE,
-          AMF_VIDEO_ENCODER_USAGE_LOW_LATENCY_HIGH_QUALITY);
+      res = AMFEncoder_->SetProperty(AMF_VIDEO_ENCODER_USAGE, amf_usage(usage));
       AMF_CHECK_RETURN(res, "SetProperty AMF_VIDEO_ENCODER_USAGE failed");
 
       // ------------- Encoder params static---------------
@@ -248,21 +296,75 @@ private:
                        "SetProperty AMF_VIDEO_ENCODER_FRAMESIZE failed, (" +
                            std::to_string(resolution_.first) + "," +
                            std::to_string(resolution_.second) + ")");
-      res = AMFEncoder_->SetProperty(AMF_VIDEO_ENCODER_LOWLATENCY_MODE, true);
+      res = AMFEncoder_->SetProperty(
+          AMF_VIDEO_ENCODER_LOWLATENCY_MODE,
+          util_encode::opt_flag(opts, "lowlatency_mode", true));
       AMF_CHECK_RETURN(res,
                        "SetProperty AMF_VIDEO_ENCODER_LOWLATENCY_MODE failed");
       res = AMFEncoder_->SetProperty(AMF_VIDEO_ENCODER_QUALITY_PRESET,
-                                     AMF_VIDEO_ENCODER_QUALITY_PRESET_QUALITY);
+                                     amf_quality_preset(preset, hevc));
       AMF_CHECK_RETURN(res,
                        "SetProperty AMF_VIDEO_ENCODER_QUALITY_PRESET failed");
       res =
           AMFEncoder_->SetProperty(AMF_VIDEO_ENCODER_COLOR_BIT_DEPTH, eDepth_);
       AMF_CHECK_RETURN(res,
                        "SetProperty(AMF_VIDEO_ENCODER_COLOR_BIT_DEPTH  failed");
-      res = AMFEncoder_->SetProperty(AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD,
-                                     AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR);
+      if (rc == 2) {
+        res = AMFEncoder_->SetProperty(
+            AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD,
+            AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_LATENCY_CONSTRAINED_VBR);
+      } else if (rc == 3 && q >= 0 && q <= 51) {
+        res = AMFEncoder_->SetProperty(
+            AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD,
+            AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CONSTANT_QP);
+      } else {
+        res = AMFEncoder_->SetProperty(
+            AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD,
+            AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR);
+      }
       AMF_CHECK_RETURN(res,
                        "SetProperty AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD");
+      if (rc == 3 && q >= 0 && q <= 51) {
+        AMFEncoder_->SetProperty(AMF_VIDEO_ENCODER_QP_I, q);
+        AMFEncoder_->SetProperty(AMF_VIDEO_ENCODER_QP_P, q);
+        AMFEncoder_->SetProperty(AMF_VIDEO_ENCODER_QP_B, q);
+      }
+      if (util_encode::has_opt(opts, "vbaq")) {
+        AMFEncoder_->SetProperty(
+            AMF_VIDEO_ENCODER_ENABLE_VBAQ,
+            util_encode::opt_flag(opts, "vbaq", false));
+      }
+      if (util_encode::has_opt(opts, "enforce_hrd")) {
+        AMFEncoder_->SetProperty(
+            AMF_VIDEO_ENCODER_ENFORCE_HRD,
+            util_encode::opt_flag(opts, "enforce_hrd", false));
+      }
+      if (util_encode::has_opt(opts, "preanalysis")) {
+        AMFEncoder_->SetProperty(
+            AMF_VIDEO_ENCODER_PRE_ANALYSIS_ENABLE,
+            util_encode::opt_flag(opts, "preanalysis", false));
+      }
+      if (util_encode::has_opt(opts, "slices_per_frame")) {
+        const int slices = util_encode::opt_int(opts, "slices_per_frame", 1);
+        if (slices > 0) {
+          AMFEncoder_->SetProperty(AMF_VIDEO_ENCODER_SLICES_PER_FRAME, slices);
+        }
+      }
+      if (util_encode::has_opt(opts, "high_motion_qb")) {
+        AMFEncoder_->SetProperty(
+            AMF_VIDEO_ENCODER_HIGH_MOTION_QUALITY_BOOST_ENABLE,
+            util_encode::opt_flag(opts, "high_motion_qb", false));
+      }
+      if (util_encode::has_opt(opts, "input_queue_size")) {
+        const int queue = util_encode::opt_int(opts, "input_queue_size", 0);
+        if (queue > 0) {
+          AMFEncoder_->SetProperty(AMF_VIDEO_ENCODER_INPUT_QUEUE_SIZE, queue);
+        }
+      }
+      if (num_ref_frame > 0) {
+        AMFEncoder_->SetProperty(AMF_VIDEO_ENCODER_MAX_NUM_REFRAMES,
+                                 num_ref_frame);
+      }
       if (enable4K_) {
         res = AMFEncoder_->SetProperty(AMF_VIDEO_ENCODER_PROFILE,
                                        AMF_VIDEO_ENCODER_PROFILE_HIGH);
@@ -320,9 +422,9 @@ private:
 
     } else if (codecStr == amf_wstring(AMFVideoEncoder_HEVC)) {
       // ------------- Encoder params usage---------------
-      res = AMFEncoder_->SetProperty(
-          AMF_VIDEO_ENCODER_HEVC_USAGE,
-          AMF_VIDEO_ENCODER_HEVC_USAGE_LOW_LATENCY_HIGH_QUALITY);
+      res =
+          AMFEncoder_->SetProperty(AMF_VIDEO_ENCODER_HEVC_USAGE,
+                                   amf_usage(usage));
       AMF_CHECK_RETURN(res, "SetProperty AMF_VIDEO_ENCODER_HEVC_USAGE failed");
 
       // ------------- Encoder params static---------------
@@ -332,14 +434,14 @@ private:
       AMF_CHECK_RETURN(res,
                        "SetProperty AMF_VIDEO_ENCODER_HEVC_FRAMESIZE failed");
 
-      res = AMFEncoder_->SetProperty(AMF_VIDEO_ENCODER_HEVC_LOWLATENCY_MODE,
-                                     true);
+      res = AMFEncoder_->SetProperty(
+          AMF_VIDEO_ENCODER_HEVC_LOWLATENCY_MODE,
+          util_encode::opt_flag(opts, "lowlatency_mode", true));
       AMF_CHECK_RETURN(res,
                        "SetProperty AMF_VIDEO_ENCODER_LOWLATENCY_MODE failed");
 
-      res = AMFEncoder_->SetProperty(
-          AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET,
-          AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_QUALITY);
+      res = AMFEncoder_->SetProperty(AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET,
+                                     amf_quality_preset(preset, hevc));
       AMF_CHECK_RETURN(
           res, "SetProperty AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET failed");
 
@@ -348,11 +450,59 @@ private:
       AMF_CHECK_RETURN(
           res, "SetProperty AMF_VIDEO_ENCODER_HEVC_COLOR_BIT_DEPTH failed");
 
-      res = AMFEncoder_->SetProperty(
-          AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD,
-          AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_CBR);
+      if (rc == 2) {
+        res = AMFEncoder_->SetProperty(
+            AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD,
+            AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_LATENCY_CONSTRAINED_VBR);
+      } else if (rc == 3 && q >= 0 && q <= 51) {
+        res = AMFEncoder_->SetProperty(
+            AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD,
+            AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_CONSTANT_QP);
+      } else {
+        res = AMFEncoder_->SetProperty(
+            AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD,
+            AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_CBR);
+      }
       AMF_CHECK_RETURN(
           res, "SetProperty AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD failed");
+      if (rc == 3 && q >= 0 && q <= 51) {
+        AMFEncoder_->SetProperty(AMF_VIDEO_ENCODER_HEVC_QP_I, q);
+        AMFEncoder_->SetProperty(AMF_VIDEO_ENCODER_HEVC_QP_P, q);
+      }
+      if (util_encode::has_opt(opts, "vbaq")) {
+        AMFEncoder_->SetProperty(
+            AMF_VIDEO_ENCODER_HEVC_ENABLE_VBAQ,
+            util_encode::opt_flag(opts, "vbaq", false));
+      }
+      if (util_encode::has_opt(opts, "enforce_hrd")) {
+        AMFEncoder_->SetProperty(
+            AMF_VIDEO_ENCODER_HEVC_ENFORCE_HRD,
+            util_encode::opt_flag(opts, "enforce_hrd", false));
+      }
+      if (util_encode::has_opt(opts, "preanalysis")) {
+        AMFEncoder_->SetProperty(
+            AMF_VIDEO_ENCODER_HEVC_PRE_ANALYSIS_ENABLE,
+            util_encode::opt_flag(opts, "preanalysis", false));
+      }
+      if (util_encode::has_opt(opts, "slices_per_frame")) {
+        const int slices = util_encode::opt_int(opts, "slices_per_frame", 1);
+        if (slices > 0) {
+          AMFEncoder_->SetProperty(AMF_VIDEO_ENCODER_HEVC_SLICES_PER_FRAME,
+                                   slices);
+        }
+      }
+      if (util_encode::has_opt(opts, "high_motion_qb")) {
+        AMFEncoder_->SetProperty(
+            AMF_VIDEO_ENCODER_HEVC_HIGH_MOTION_QUALITY_BOOST_ENABLE,
+            util_encode::opt_flag(opts, "high_motion_qb", false));
+      }
+      if (util_encode::has_opt(opts, "input_queue_size")) {
+        const int queue = util_encode::opt_int(opts, "input_queue_size", 0);
+        if (queue > 0) {
+          AMFEncoder_->SetProperty(AMF_VIDEO_ENCODER_HEVC_INPUT_QUEUE_SIZE,
+                                   queue);
+        }
+      }
 
       if (enable4K_) {
         res = AMFEncoder_->SetProperty(AMF_VIDEO_ENCODER_HEVC_TIER,
@@ -417,6 +567,12 @@ private:
     } else {
       return AMF_FAIL;
     }
+    LOG_INFO("amf encode params: usage=" + std::to_string(usage) +
+             ", preset=" + std::to_string(preset) + ", rc=" +
+             std::to_string(rc) + ", q=" + std::to_string(q) + ", kbs=" +
+             std::to_string(bitRateIn_ / 1000) + ", gop=" +
+             std::to_string(gop_) +
+             ", num_ref_frame=" + std::to_string(num_ref_frame));
     return AMF_OK;
   }
 
@@ -473,8 +629,10 @@ void *amf_new_encoder(void *handle, int64_t luid,
                       DataFormat dataFormat, int32_t width, int32_t height,
                       int32_t kbs, int32_t framerate, int32_t gop,
                       int quality, int rc, int q, int spatial_aq,
-                      int temporal_aq, int multipass, int preanalysis) {
-  // native AMF path does not consume the ffmpeg-style encode profile args yet
+                      int temporal_aq, int multipass, int preanalysis,
+                      const char *opts) {
+  // native AMF path does not consume the ffmpeg-style encode profile args,
+  // it reads the vendor options from opts instead
   (void)quality; (void)rc; (void)q; (void)spatial_aq; (void)temporal_aq;
   (void)multipass; (void)preanalysis;
   AMFEncoder *enc = NULL;
@@ -488,7 +646,7 @@ void *amf_new_encoder(void *handle, int64_t luid,
       return NULL;
     }
     enc = new AMFEncoder(handle, memoryType, codecStr, dataFormat, width,
-                         height, kbs * 1000, framerate, gop);
+                         height, kbs * 1000, framerate, gop, opts);
     if (enc) {
       if (AMF_OK == enc->initialize()) {
         return enc;
@@ -547,7 +705,7 @@ int amf_test_encode(int64_t *outLuids, int32_t *outVendors, int32_t maxDescNum, 
       AMFEncoder *e = (AMFEncoder *)amf_new_encoder(
           (void *)adapter.get()->device_.Get(), currentLuid,
           dataFormat, width, height, kbs, framerate, gop,
-          Quality_Default, RC_CBR, -1, 0, 0, 0, 0);
+          Quality_Default, RC_CBR, -1, 0, 0, 0, 0, NULL);
       if (!e)
         continue;
       if (e->test() == AMF_OK) {

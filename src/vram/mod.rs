@@ -22,7 +22,7 @@ pub struct FeatureContext {
     pub data_format: DataFormat,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 pub struct DynamicContext {
     #[serde(skip)]
     pub device: Option<*mut c_void>,
@@ -42,6 +42,8 @@ pub struct DynamicContext {
     /// nvenc multipass: 0=disabled 1=two pass quarter res 2=two pass full res
     pub multipass: i32,
     pub preanalysis: bool,
+    /// 厂商私有参数, 格式 "key=value;key=value", 各厂商只读自己认识的 key
+    pub opts: String,
 }
 
 unsafe impl Send for DynamicContext {}

@@ -1,6 +1,7 @@
 #ifndef UTIL_H
 #define UTIL_H
 
+#include <map>
 #include <string>
 #include <chrono>
 #include <thread>
@@ -9,6 +10,15 @@ extern "C" {
 }
 
 namespace util_encode {
+
+// 编码参数透传: 形如 "key=value;key=value" 的字符串拆成表, 各厂商只读取自己
+// 认识的 key, 未出现的 key 一律沿用 SDK 默认值 (即不传时行为不变)。
+std::map<std::string, std::string> parse_opts(const char *opts);
+bool has_opt(const std::map<std::string, std::string> &opts, const char *key);
+int opt_int(const std::map<std::string, std::string> &opts, const char *key,
+            int fallback);
+bool opt_flag(const std::map<std::string, std::string> &opts, const char *key,
+              bool fallback);
 
 void set_av_codec_ctx(AVCodecContext *c, const std::string &name, int kbs,
                       int gop, int fps);

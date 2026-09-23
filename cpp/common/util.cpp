@@ -63,6 +63,57 @@ void set_av_codec_ctx(AVCodecContext *c, const std::string &name, int kbs,
   }
 }
 
+std::map<std::string, std::string> parse_opts(const char *opts) {
+  std::map<std::string, std::string> m;
+  if (opts == nullptr) {
+    return m;
+  }
+  std::string s(opts);
+  size_t pos = 0;
+  while (pos < s.size()) {
+    size_t end = s.find(';', pos);
+    if (end == std::string::npos) {
+      end = s.size();
+    }
+    std::string kv = s.substr(pos, end - pos);
+    pos = end + 1;
+    size_t eq = kv.find('=');
+    if (eq == std::string::npos || eq == 0) {
+      continue;
+    }
+    m[kv.substr(0, eq)] = kv.substr(eq + 1);
+  }
+  return m;
+}
+
+bool has_opt(const std::map<std::string, std::string> &opts, const char *key) {
+  auto it = opts.find(key);
+  return it != opts.end() && !it->second.empty();
+}
+
+int opt_int(const std::map<std::string, std::string> &opts, const char *key,
+            int fallback) {
+  auto it = opts.find(key);
+  if (it == opts.end() || it->second.empty()) {
+    return fallback;
+  }
+  char *end = nullptr;
+  long v = strtol(it->second.c_str(), &end, 10);
+  if (end == it->second.c_str()) {
+    return fallback;
+  }
+  return (int)v;
+}
+
+bool opt_flag(const std::map<std::string, std::string> &opts, const char *key,
+              bool fallback) {
+  auto it = opts.find(key);
+  if (it == opts.end() || it->second.empty()) {
+    return fallback;
+  }
+  return it->second != "0";
+}
+
 // Intel QSV/VAAPI 的 async_depth 决定硬编码流水线里可以重叠多少帧。
 // 上游为了"最低延迟"写死 1, 但这会让 iGPU 无法重叠 "取帧-编码-回读", 编码吞吐腰斩:
 // 14代之前的核显 (如 UHD 750) 在 1440p 真实运动画面下实测

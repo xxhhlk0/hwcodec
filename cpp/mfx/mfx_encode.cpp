@@ -105,13 +105,14 @@ public:
   int32_t kbs_;
   int32_t framerate_;
   int32_t gop_;
+  std::string opts_;
 
   bool full_range_ = false;
   bool bt709_ = false;
 
   VplEncoder(void *handle, int64_t luid, DataFormat dataFormat,
              int32_t width, int32_t height, int32_t kbs, int32_t framerate,
-             int32_t gop) {
+             int32_t gop, const char *opts) {
     handle_ = handle;
     luid_ = luid;
     dataFormat_ = dataFormat;
@@ -120,6 +121,7 @@ public:
     kbs_ = kbs;
     framerate_ = framerate;
     gop_ = gop;
+    opts_ = opts ? opts : "";
   }
 
   ~VplEncoder() {}
@@ -462,23 +464,57 @@ private:
 
     mfxEncParams_.IOPattern = MFX_IOPATTERN_IN_VIDEO_MEMORY;
 
+    auto opts = util_encode::parse_opts(opts_.c_str());
+
     // Configuration for low latency
     // AsyncDepth=1 时每帧提交后阻塞 SyncOperation; >1 允许 N 帧在飞, 由
     // encode() 延迟收取实现流水线。HWCODEC_ASYNC_DEPTH=1 可退回同步行为。
-    mfxEncParams_.AsyncDepth = util_encode::hw_async_depth();
+    mfxEncParams_.AsyncDepth =
+        util_encode::opt_int(opts, "async_depth", util_encode::hw_async_depth());
     mfxEncParams_.mfx.GopRefDist =
         1; // 1 is best for low latency, I and P frames only
     mfxEncParams_.mfx.GopPicSize = (gop_ > 0 && gop_ < 0xFFFF) ? gop_ : 0xFFFF;
     // quality
     // https://www.intel.com/content/www/us/en/developer/articles/technical/common-bitrate-control-methods-in-intel-media-sdk.html
-    mfxEncParams_.mfx.TargetUsage = MFX_TARGETUSAGE_BEST_SPEED;
-    mfxEncParams_.mfx.RateControlMethod = MFX_RATECONTROL_VBR;
+    // MFX_TARGETUSAGE_1 是最好画质、MFX_TARGETUSAGE_7 是最快, 与 preset 的
+    // "数值越大画质越好" 反向, 故取 8 - preset。
+    const int preset = util_encode::opt_int(opts, "preset", 0);
+    mfxEncParams_.mfx.TargetUsage = (preset >= 1 && preset <= 7)
+                                        ? (mfxU16)(8 - preset)
+                                        : MFX_TARGETUSAGE_BEST_SPEED;
+    const int q = util_encode::opt_int(opts, "q", -1);
+    switch (util_encode::opt_int(opts, "rc", 0)) {
+    case 1:
+      mfxEncParams_.mfx.RateControlMethod = MFX_RATECONTROL_CBR;
+      break;
+    case 2:
+      mfxEncParams_.mfx.RateControlMethod = MFX_RATECONTROL_VBR;
+      break;
+    case 3:
+      // ICQ 以画质值为目标, 越界时不改码控模式, 由驱动默认 QP 兜底
+      if (q > 0 && q <= 51) {
+        mfxEncParams_.mfx.RateControlMethod = MFX_RATECONTROL_ICQ;
+        mfxEncParams_.mfx.ICQQuality = (mfxU16)q;
+      } else {
+        mfxEncParams_.mfx.RateControlMethod = MFX_RATECONTROL_VBR;
+      }
+      break;
+    default:
+      mfxEncParams_.mfx.RateControlMethod = MFX_RATECONTROL_VBR;
+      break;
+    }
     mfxEncParams_.mfx.InitialDelayInKB = 0;
     mfxEncParams_.mfx.BufferSizeInKB = 512;
     mfxEncParams_.mfx.TargetKbps = kbs_;
     mfxEncParams_.mfx.MaxKbps = kbs_;
     mfxEncParams_.mfx.NumSlice = 1;
-    mfxEncParams_.mfx.NumRefFrame = 0;
+    mfxEncParams_.mfx.NumRefFrame =
+        (mfxU16)util_encode::opt_int(opts, "num_ref_frame", 0);
+    if (util_encode::has_opt(opts, "low_power")) {
+      mfxEncParams_.mfx.LowPower = util_encode::opt_flag(opts, "low_power", false)
+                                       ? MFX_CODINGOPTION_ON
+                                       : MFX_CODINGOPTION_OFF;
+    }
 
     if (H264 == dataFormat_) {
       mfxEncParams_.mfx.CodecLevel = MFX_LEVEL_AVC_51;
@@ -512,6 +548,17 @@ private:
     MSDK_IGNORE_MFX_STS(sts, MFX_WRN_INCOMPATIBLE_VIDEO_PARAM);
     CHECK_STATUS(sts, "Query");
     async_ = mfxEncParams_.AsyncDepth > 1;
+    LOG_INFO("mfx encode params: preset=" + std::to_string(preset) +
+             ", target_usage=" + std::to_string(mfxEncParams_.mfx.TargetUsage) +
+             ", rc=" + std::to_string(mfxEncParams_.mfx.RateControlMethod) +
+             ", q=" + std::to_string(q) + ", icq_quality=" +
+             std::to_string(mfxEncParams_.mfx.ICQQuality) + ", kbs=" +
+             std::to_string(mfxEncParams_.mfx.TargetKbps) + ", gop=" +
+             std::to_string(mfxEncParams_.mfx.GopPicSize) +
+             ", gop_ref_dist=" + std::to_string(mfxEncParams_.mfx.GopRefDist) +
+             ", num_ref_frame=" + std::to_string(mfxEncParams_.mfx.NumRefFrame) +
+             ", async_depth=" + std::to_string(mfxEncParams_.AsyncDepth) +
+             ", low_power=" + std::to_string(mfxEncParams_.mfx.LowPower));
 
     mfxFrameAllocRequest EncRequest;
     memset(&EncRequest, 0, sizeof(EncRequest));
@@ -750,11 +797,18 @@ private:
   }
 
   void resetEncExtParams() {
+    auto opts = util_encode::parse_opts(opts_.c_str());
+
     // coding option
     memset(&coding_option_, 0, sizeof(mfxExtCodingOption));
     coding_option_.Header.BufferId = MFX_EXTBUFF_CODING_OPTION;
     coding_option_.Header.BufferSz = sizeof(mfxExtCodingOption);
     coding_option_.NalHrdConformance = MFX_CODINGOPTION_OFF;
+    if (util_encode::has_opt(opts, "cavlc")) {
+      coding_option_.CAVLC = util_encode::opt_flag(opts, "cavlc", false)
+                                 ? MFX_CODINGOPTION_ON
+                                 : MFX_CODINGOPTION_OFF;
+    }
     extbuffers_[0] = (mfxExtBuffer *)&coding_option_;
 
     // coding option2
@@ -768,6 +822,11 @@ private:
     memset(&coding_option3_, 0, sizeof(mfxExtCodingOption3));
     coding_option3_.Header.BufferId = MFX_EXTBUFF_CODING_OPTION3;
     coding_option3_.Header.BufferSz = sizeof(mfxExtCodingOption3);
+    if (util_encode::has_opt(opts, "low_delay_brc")) {
+      coding_option3_.LowDelayBRC = util_encode::opt_flag(opts, "low_delay_brc", false)
+                                        ? MFX_CODINGOPTION_ON
+                                        : MFX_CODINGOPTION_OFF;
+    }
     extbuffers_[2] = (mfxExtBuffer *)&coding_option3_;
     
     // signal info
@@ -838,14 +897,16 @@ void *mfx_new_encoder(void *handle, int64_t luid,
                       DataFormat dataFormat, int32_t w, int32_t h, int32_t kbs,
                       int32_t framerate, int32_t gop,
                       int quality, int rc, int q, int spatial_aq,
-                      int temporal_aq, int multipass, int preanalysis) {
-  // native MFX path does not consume the ffmpeg-style encode profile args yet
+                      int temporal_aq, int multipass, int preanalysis,
+                      const char *opts) {
+  // native MFX path does not consume the ffmpeg-style encode profile args,
+  // it reads the vendor options from opts instead
   (void)quality; (void)rc; (void)q; (void)spatial_aq; (void)temporal_aq;
   (void)multipass; (void)preanalysis;
   VplEncoder *p = NULL;
   try {
     p = new VplEncoder(handle, luid, dataFormat, w, h, kbs, framerate,
-                       gop);
+                       gop, opts);
     if (!p) {
       return NULL;
     }
@@ -899,7 +960,7 @@ int mfx_test_encode(int64_t *outLuids, int32_t *outVendors, int32_t maxDescNum, 
       VplEncoder *e = (VplEncoder *)mfx_new_encoder(
           (void *)adapter.get()->device_.Get(), currentLuid,
           dataFormat, width, height, kbs, framerate, gop,
-          Quality_Default, RC_CBR, -1, 0, 0, 0, 0);
+          Quality_Default, RC_CBR, -1, 0, 0, 0, 0, NULL);
       if (!e)
         continue;
       if (e->native_->EnsureTexture(e->width_, e->height_)) {
