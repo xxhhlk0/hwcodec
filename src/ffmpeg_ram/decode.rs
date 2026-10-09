@@ -105,6 +105,11 @@ impl Decoder {
         }
     }
 
+    /// 上一次 decode 产出的帧 (不清空)。用于调用方需要先换掉解码器、再取帧的场景。
+    pub fn frames(&mut self) -> &mut Vec<DecodeFrame> {
+        unsafe { &mut *self.frames }
+    }
+
     unsafe extern "C" fn callback(
         obj: *const c_void,
         width: c_int,

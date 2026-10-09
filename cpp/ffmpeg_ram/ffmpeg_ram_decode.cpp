@@ -8,10 +8,13 @@ extern "C" {
 #include <libavutil/pixdesc.h>
 }
 
+#include <cstring>
 #include <memory>
 #include <stdbool.h>
+#include <vector>
 
 #define LOG_MODULE "FFMPEG_RAM_DEC"
+#include <annexb.h>
 #include <log.h>
 #include <util.h>
 
@@ -44,6 +47,18 @@ public:
   int thread_count_ = 1;
   RamDecodeCallback callback_ = NULL;
   DataFormat data_format_;
+
+  // mediacodec wrapper 在 open 阶段就要求 extradata 非空, 而参数集只能从码流
+  // 首包里取 (见 annexb.h), 所以它走延迟 open: reset() 只建上下文, 首次
+  // decode() 拿到参数集后再 open。
+  const AVCodec *codec_ = NULL;
+  bool opened_ = false;
+  bool open_failed_ = false;
+  bool got_vps_ = false;
+  bool got_sps_ = false;
+  bool got_pps_ = false;
+  std::vector<uint8_t> extradata_;
+  int no_parameter_set_count_ = 0;
 
 #ifdef CFG_PKG_TRACE
   int in_ = 0;
@@ -88,14 +103,20 @@ public:
       return -1;
     }
     free_decoder();
-    const AVCodec *codec = NULL;
+    opened_ = false;
+    open_failed_ = false;
+    got_vps_ = false;
+    got_sps_ = false;
+    got_pps_ = false;
+    extradata_.clear();
+    no_parameter_set_count_ = 0;
     hwaccel_ = device_type_ != AV_HWDEVICE_TYPE_NONE;
     int ret;
-    if (!(codec = avcodec_find_decoder_by_name(name_.c_str()))) {
+    if (!(codec_ = avcodec_find_decoder_by_name(name_.c_str()))) {
       LOG_ERROR(std::string("avcodec_find_decoder_by_name ") + name_ + " failed");
       return -1;
     }
-    if (!(c_ = avcodec_alloc_context3(codec))) {
+    if (!(c_ = avcodec_alloc_context3(codec_))) {
       LOG_ERROR(std::string("Could not allocate video codec context"));
       return -1;
     }
@@ -143,10 +164,13 @@ public:
       return -1;
     }
 
-    if ((ret = avcodec_open2(c_, codec, NULL)) != 0) {
+    // 见成员注释: mediacodec 延迟到首次 decode() 再 open。
+    const bool defer_open = name_.find("mediacodec") != std::string::npos;
+    if (!defer_open && (ret = avcodec_open2(c_, codec_, NULL)) != 0) {
       LOG_ERROR(std::string("avcodec_open2 failed, ret = ") + av_err2str(ret));
       return -1;
     }
+    opened_ = !defer_open;
 #ifdef CFG_PKG_TRACE
     in_ = 0;
     out_ = 0;
@@ -166,6 +190,12 @@ public:
       LOG_ERROR(std::string("illegal decode parameter"));
       return -1;
     }
+    if (!opened_) {
+      ret = open_with_extradata(data, length);
+      if (ret != 0) {
+        return ret;
+      }
+    }
     pkt_->data = (uint8_t *)data;
     pkt_->size = length;
     ret = do_decode(obj);
@@ -173,6 +203,44 @@ public:
   }
 
 private:
+  // 用码流里的参数集补上 extradata 再 open (仅延迟 open 的解码器会走到)。
+  // 拿不到参数集时返回 -1 且不置 open_failed_: 参数集可能被拆到后面的包里,
+  // 下一包补齐后再试。open 真失败则置 open_failed_ 不再重试。
+  int open_with_extradata(const uint8_t *data, int length) {
+    if (open_failed_) {
+      return -1;
+    }
+    if (!util_decode::collect_parameter_sets(data, length, data_format_,
+                                             extradata_, got_vps_, got_sps_,
+                                             got_pps_)) {
+      if (no_parameter_set_count_++ == 0) {
+        LOG_WARN(std::string("no parameter set in packet, wait for the next: ") +
+                 name_);
+      }
+      return -1;
+    }
+    c_->extradata =
+        (uint8_t *)av_mallocz(extradata_.size() + AV_INPUT_BUFFER_PADDING_SIZE);
+    if (!c_->extradata) {
+      LOG_ERROR(std::string("av_mallocz extradata failed"));
+      open_failed_ = true;
+      return -1;
+    }
+    memcpy(c_->extradata, extradata_.data(), extradata_.size());
+    c_->extradata_size = (int)extradata_.size();
+
+    int ret = avcodec_open2(c_, codec_, NULL);
+    if (ret < 0) {
+      LOG_ERROR(std::string("avcodec_open2 failed, ret = ") + av_err2str(ret));
+      open_failed_ = true;
+      return -1;
+    }
+    opened_ = true;
+    LOG_INFO(std::string("opened ") + name_ + " with extradata " +
+             std::to_string(extradata_.size()) + " bytes");
+    return 0;
+  }
+
   int do_decode(const void *obj) {
     int ret;
     AVFrame *tmp_frame = NULL;
