@@ -40,7 +40,13 @@ public:
   // 硬件解码器是异步流水线: mediacodec 在输入缓冲填满之前只会返回 EAGAIN,
   // 首帧往往要等好几个包才出来。EAGAIN 不是错误, 但也不能无限等 —— 一帧都
   // 没出过且连续这么多次仍无输出, 才判定为真失败交上层回退。
+  // mediacodec 的上限要收紧: 失败必须快速上报, 让上层 fallback_to_soft 接管。
+  // 拖久了上层的 fail_counter 会把整个 H264 标为不支持 (client.rs 的首帧判定
+  // 一次就跳到 MAX), 服务端随之退到 AV1 软编 —— 比等软解回退糟糕得多。
+  // 10 包足够区分"还没喂够"与"真出不了帧"(如流分辨率超出设备硬解上限)。
+  // Windows 的 D3D11VA 流水线更深 (显存拷贝 + 异步), 保持宽限不动。
   static const int MAX_EAGAIN_WITHOUT_FRAME = 60;
+  static const int MAX_EAGAIN_WITHOUT_FRAME_MEDIACODEC = 10;
 
   AVCodecContext *c_ = NULL;
   AVBufferRef *hw_device_ctx_ = NULL;
@@ -386,7 +392,14 @@ private:
       // 返回 EAGAIN, 首帧要等好几个包才出来。以前这里一律返回 -1, 上层会立刻
       // 判定解码失败并回退软解, 硬解因此永远用不上。
       // 有界: 一帧都没出过且连续这么多次仍无输出, 才判定为真失败。
-      if (decoded_total_ == 0 && ++again_count_ > MAX_EAGAIN_WITHOUT_FRAME) {
+      // mediacodec 上限收紧 (见 MAX_EAGAIN_WITHOUT_FRAME_MEDIACODEC), 让上层
+      // 尽快 fallback_to_soft; 超限后每个包都会走到这里重试, 直到某个包让软解
+      // 起来 (fallback 要求当前包是 IDR)。
+      const int max_again =
+          name_.find("mediacodec") != std::string::npos
+              ? MAX_EAGAIN_WITHOUT_FRAME_MEDIACODEC
+              : MAX_EAGAIN_WITHOUT_FRAME;
+      if (decoded_total_ == 0 && ++again_count_ > max_again) {
         LOG_ERROR(std::string("no frame after ") + std::to_string(again_count_) +
                   " packets, give up: " + name_);
         return -1;
