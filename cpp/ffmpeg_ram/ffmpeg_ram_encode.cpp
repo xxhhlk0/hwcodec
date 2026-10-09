@@ -123,6 +123,9 @@ public:
   int gop_ = 0xFFFF;
   int thread_count_ = 1;
   int gpu_ = 0;
+  // 厂商私有参数串 "key=value;..." (来自 rustdesk 的编码 profile)。
+  // 在 init() 里于内建默认之后应用, 保证手动设置的值优先 (见 apply_qsv_vendor_opts)。
+  std::string opts_;
   RamEncodeCallback callback_ = NULL;
   int offset_[AV_NUM_DATA_POINTERS] = {0};
 
@@ -139,7 +142,7 @@ public:
                    int pixfmt, int align, int fps, int gop, int rc, int quality,
                    int kbs, int q, int spatial_aq, int temporal_aq,
                    int multipass, int preanalysis, int thread_count, int gpu,
-                   RamEncodeCallback callback) {
+                   const char *opts, RamEncodeCallback callback) {
     name_ = name;
     mc_name_ = mc_name ? mc_name : "";
     width_ = width;
@@ -158,6 +161,7 @@ public:
     preanalysis_ = preanalysis;
     thread_count_ = thread_count;
     gpu_ = gpu;
+    opts_ = opts ? opts : "";
     callback_ = callback;
     if (name_.find("vaapi") != std::string::npos) {
       hw_device_type_ = AV_HWDEVICE_TYPE_VAAPI;
@@ -261,8 +265,15 @@ public:
       return false;
     }
     // qsv: low_power + low_delay_brc (吞吐相关; 老核显不支持时由下方 open 回退)
-    qsv_low_latency_applied_ =
+    const bool qsv_low_latency_default =
         util_encode::apply_qsv_low_latency(c_->priv_data, name_);
+    // profile 下发的厂商私有参数覆盖上面的内建默认 (手动设置优先);
+    // 与 ffmpeg_vram 通道共用 util_encode::apply_qsv_vendor_opts 一份实现。
+    // 这条路径此前完全没有 opts 入口, 导致 async_depth/low_power 等手动值在
+    // RAM 通道上被内建默认静默盖掉 (vram 降级到 RAM 后用户调参"没反应"的根因)。
+    qsv_low_latency_applied_ = util_encode::apply_qsv_vendor_opts(
+        c_->priv_data, name_, util_encode::parse_opts(opts_.c_str()),
+        qsv_low_latency_default);
     // preset/quality: previously commented out, so the quality argument passed in from
     // rustdesk (encode profile) had no effect at all. Quality_Default is a no-op, so this
     // only changes behaviour when a non-default preset is explicitly requested.
@@ -286,7 +297,8 @@ public:
              ", gop=" + std::to_string(gop_) +
              ", bit_rate=" + std::to_string(c_->bit_rate) +
              ", rc_max_rate=" + std::to_string(c_->rc_max_rate) +
-             ", global_quality=" + std::to_string(c_->global_quality));
+             ", global_quality=" + std::to_string(c_->global_quality) +
+             ", opts=" + (opts_.empty() ? "(none)" : opts_));
     if (name_.find("mediacodec") != std::string::npos) {
       if (mc_name_.length() > 0) {
         LOG_INFO(std::string("mediacodec codec_name: ") + mc_name_);
@@ -501,14 +513,15 @@ ffmpeg_ram_new_encoder(const char *name, const char *mc_name, int width,
                        int height, int pixfmt, int align, int fps, int gop,
                        int rc, int quality, int kbs, int q, int spatial_aq,
                        int temporal_aq, int multipass, int preanalysis,
-                       int thread_count, int gpu, int *linesize, int *offset,
-                       int *length, RamEncodeCallback callback) {
+                       int thread_count, int gpu, const char *opts,
+                       int *linesize, int *offset, int *length,
+                       RamEncodeCallback callback) {
   FFmpegRamEncoder *encoder = NULL;
   try {
     encoder = new FFmpegRamEncoder(name, mc_name, width, height, pixfmt, align,
                                    fps, gop, rc, quality, kbs, q, spatial_aq,
                                    temporal_aq, multipass, preanalysis,
-                                   thread_count, gpu, callback);
+                                   thread_count, gpu, opts, callback);
     if (encoder) {
       if (encoder->init(linesize, offset, length)) {
         return encoder;

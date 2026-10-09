@@ -230,6 +230,50 @@ bool apply_qsv_low_latency(void *priv_data, const std::string &name) {
   return applied;
 }
 
+// 厂商私有参数 (profile 下发) 的优先级: 手动设置 > 内建默认。
+// 上游把 qsv/vaapi 的 async_depth 写死成 1, 本分支又把 low_power/low_delay_brc
+// 默认打开 —— 这两处都在本文件里, 若不给 profile 一个后置覆盖入口,
+// "手动把 async_depth 调到 2/4" 这类诉求在 RAM 通道上完全无从生效
+// (ffmpeg_vram 此前只有一段临时分支, ffmpeg_ram 连入口都没有)。
+// 统一收敛到本函数: 内建默认先下发, 本函数后下发, 后者覆盖前者。
+// 每个被覆盖的 key 都打一行 INFO, 便于在被控端日志里直接确认"手动值到底生效没有"
+// (内建默认那几行日志是覆盖前的值, 不能用来判断最终取值)。
+bool apply_qsv_vendor_opts(void *priv_data, const std::string &name,
+                           const std::map<std::string, std::string> &opts,
+                           bool low_latency_default) {
+  if (name.find("qsv") == std::string::npos) {
+    return low_latency_default;
+  }
+  // 未在 profile 里出现的 key 保持内建默认, 出现的一律以 profile 为准
+  bool low_power = low_latency_default;
+  bool low_delay_brc = low_latency_default;
+  if (has_opt(opts, "low_power")) {
+    const int v = opt_flag(opts, "low_power", true) ? 1 : 0;
+    av_opt_set_int(priv_data, "low_power", v, 0);
+    low_power = v == 1;
+    LOG_INFO(std::string("qsv vendor opt override: low_power=") + std::to_string(v));
+  }
+  if (has_opt(opts, "low_delay_brc")) {
+    const int v = opt_flag(opts, "low_delay_brc", true) ? 1 : 0;
+    av_opt_set_int(priv_data, "low_delay_brc", v, 0);
+    low_delay_brc = v == 1;
+    LOG_INFO(std::string("qsv vendor opt override: low_delay_brc=") + std::to_string(v));
+  }
+  if (has_opt(opts, "async_depth")) {
+    const int depth = opt_int(opts, "async_depth", 0);
+    if (depth > 0) {
+      av_opt_set_int(priv_data, "async_depth", depth, 0);
+      LOG_INFO(std::string("qsv vendor opt override: async_depth=") + std::to_string(depth));
+    }
+  }
+  if (has_opt(opts, "cavlc")) {
+    const int v = opt_flag(opts, "cavlc", false) ? 1 : 0;
+    av_opt_set_int(priv_data, "cavlc", v, 0);
+    LOG_INFO(std::string("qsv vendor opt override: cavlc=") + std::to_string(v));
+  }
+  return low_power || low_delay_brc;
+}
+
 // open 失败时的回退: 两个开关一起关掉 (低版本驱动可能只认其中一个), 由调用方再
 // open 一次。返回是否做过回退。
 bool revert_qsv_low_latency(void *priv_data, const std::string &name) {

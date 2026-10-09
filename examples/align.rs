@@ -44,6 +44,7 @@ fn setup_ram(max_align: i32) {
             multipass: 0,
             preanalysis: false,
             thread_count: 1,
+            opts: String::new(),
         },
         None,
     );
@@ -114,6 +115,7 @@ fn test_ram(width: i32, height: i32, encode_info: CodecInfo, decode_info: CodecI
         temporal_aq: false,
         multipass: 0,
         preanalysis: false,
+        opts: String::new(),
     };
     let decode_ctx = DecodeContext {
         name: decode_info.name.clone(),

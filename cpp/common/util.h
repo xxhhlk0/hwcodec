@@ -31,6 +31,14 @@ int hw_pool_size();
 // qsv: low_power=1 + low_delay_brc=1; 返回是否下发了至少一项 (调用方据此在
 // avcodec_open2 失败时回退重试)。非 qsv 编码器直接返回 false。
 bool apply_qsv_low_latency(void *priv_data, const std::string &name);
+// 应用 profile 下发的 qsv 私有参数 (cavlc/low_power/low_delay_brc/async_depth),
+// 覆盖上面内建默认值 —— 即"手动设置的值优先于内建默认"。调用方必须在内建默认
+// 之后调用 (ffmpeg_ram / ffmpeg_vram 两个通道都是这个顺序)。
+// low_latency_default: apply_qsv_low_latency() 的返回值。
+// 返回应用后 low_power 或 low_delay_brc 是否为 1 (调用方据此决定 open 失败时是否回退)。
+bool apply_qsv_vendor_opts(void *priv_data, const std::string &name,
+                           const std::map<std::string, std::string> &opts,
+                           bool low_latency_default);
 bool revert_qsv_low_latency(void *priv_data, const std::string &name);
 bool set_quality(void *priv_data, const std::string &name, int quality);
 bool set_rate_control(AVCodecContext *c, const std::string &name, int rc,

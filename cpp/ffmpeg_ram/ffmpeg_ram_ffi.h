@@ -17,8 +17,8 @@ void *ffmpeg_ram_new_encoder(const char *name, const char *mc_name, int width,
                              int gop, int rc, int quality, int kbs, int q,
                              int spatial_aq, int temporal_aq, int multipass,
                              int preanalysis, int thread_count, int gpu,
-                             int *linesize, int *offset, int *length,
-                             RamEncodeCallback callback);
+                             const char *opts, int *linesize, int *offset,
+                             int *length, RamEncodeCallback callback);
 void *ffmpeg_ram_new_decoder(const char *name, int device_type,
                              int thread_count, RamDecodeCallback callback);
 int ffmpeg_ram_encode(void *encoder, const uint8_t *data, int length,

@@ -91,6 +91,7 @@ fn decode_encode(
         temporal_aq: false,
         multipass: 0,
         preanalysis: false,
+        opts: String::new(),
     };
     let mut video_encoder = Encoder::new(enc_ctx).unwrap();
     let mut encode_file =

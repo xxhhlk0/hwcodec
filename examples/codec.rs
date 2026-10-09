@@ -34,6 +34,7 @@ fn main() {
         temporal_aq: false,
         multipass: 0,
         preanalysis: false,
+        opts: String::new(),
     };
     let decode_ctx = DecodeContext {
         name: String::from("hevc"),

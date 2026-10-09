@@ -33,6 +33,7 @@ fn main() {
         temporal_aq: false,
         multipass: 0,
         preanalysis: false,
+        opts: String::new(),
     };
     let yuv_count = 10;
     println!("benchmark");

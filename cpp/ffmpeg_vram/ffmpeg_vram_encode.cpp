@@ -195,31 +195,13 @@ public:
       return false;
     }
     // qsv: low_power + low_delay_brc (吞吐相关; 老核显不支持时由下方 open 回退)
-    qsv_low_latency_applied_ =
-        util_encode::apply_qsv_low_latency(c_->priv_data, encoder_->name_);
     auto opts = util_encode::parse_opts(opts_.c_str());
-    if (encoder_->name_.find("qsv") != std::string::npos) {
-      if (util_encode::has_opt(opts, "low_power")) {
-        const int v = util_encode::opt_flag(opts, "low_power", true) ? 1 : 0;
-        av_opt_set_int(c_->priv_data, "low_power", v, 0);
-        qsv_low_latency_applied_ = qsv_low_latency_applied_ || v == 1;
-      }
-      if (util_encode::has_opt(opts, "low_delay_brc")) {
-        const int v = util_encode::opt_flag(opts, "low_delay_brc", true) ? 1 : 0;
-        av_opt_set_int(c_->priv_data, "low_delay_brc", v, 0);
-        qsv_low_latency_applied_ = qsv_low_latency_applied_ || v == 1;
-      }
-      if (util_encode::has_opt(opts, "async_depth")) {
-        const int depth = util_encode::opt_int(opts, "async_depth", 0);
-        if (depth > 0) {
-          av_opt_set_int(c_->priv_data, "async_depth", depth, 0);
-        }
-      }
-      if (util_encode::has_opt(opts, "cavlc")) {
-        av_opt_set_int(c_->priv_data, "cavlc",
-                       util_encode::opt_flag(opts, "cavlc", false) ? 1 : 0, 0);
-      }
-    }
+    const bool qsv_low_latency_default =
+        util_encode::apply_qsv_low_latency(c_->priv_data, encoder_->name_);
+    // profile 下发的厂商私有参数覆盖上面的内建默认 (手动设置优先);
+    // 与 ffmpeg_ram 通道共用 util_encode::apply_qsv_vendor_opts 一份实现
+    qsv_low_latency_applied_ = util_encode::apply_qsv_vendor_opts(
+        c_->priv_data, encoder_->name_, opts, qsv_low_latency_default);
     // preset/quality: previously commented out (Quality_Default is a no-op), so the
     // encode profile preset had no effect on the vram path. Same mapping as the RAM path.
     if (!util_encode::set_quality(c_->priv_data, encoder_->name_, quality_)) {

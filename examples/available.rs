@@ -42,6 +42,7 @@ fn ram() {
         multipass: 0,
         preanalysis: false,
         thread_count: 1,
+        opts: String::new(),
     };
     let encoders = Encoder::available_encoders(ctx.clone(), None);
     encoders.iter().map(|e| println!("{:?}", e)).count();

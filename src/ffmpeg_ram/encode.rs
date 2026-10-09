@@ -44,6 +44,10 @@ pub struct EncodeContext {
     pub multipass: i32,
     pub preanalysis: bool,
     pub thread_count: i32,
+    /// 厂商私有参数串 "key=value;key=value" (qsv: cavlc/low_power/low_delay_brc/
+    /// async_depth; nvenc/amf 的 key 由 nv/amf 通道各自读取)。
+    /// C 侧在内建默认之后应用, 即"手动设置的值优先"; 空串 = 全部沿用内建默认。
+    pub opts: String,
 }
 
 pub struct EncodeFrame {
@@ -85,6 +89,7 @@ impl Encoder {
                 .parse()
                 .unwrap_or(-1);
             let mc_name = ctx.mc_name.clone().unwrap_or_default();
+            let opts = ctx.opts.clone();
             let codec = ffmpeg_ram_new_encoder(
                 CString::new(ctx.name.as_str()).map_err(|_| ())?.as_ptr(),
                 CString::new(mc_name.as_str()).map_err(|_| ())?.as_ptr(),
@@ -104,6 +109,7 @@ impl Encoder {
                 ctx.preanalysis as _,
                 ctx.thread_count,
                 gpu,
+                CString::new(opts.as_str()).map_err(|_| ())?.as_ptr(),
                 linesize.as_mut_ptr(),
                 offset.as_mut_ptr(),
                 length.as_mut_ptr(),
