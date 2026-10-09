@@ -37,6 +37,10 @@ class FFmpegRamDecoder {
 public:
   // 参数集/尺寸最多等多少个包 (≈1s@30fps); 超了就走软解回退。
   static const int MAX_DEFER_COUNT = 30;
+  // 硬件解码器是异步流水线: mediacodec 在输入缓冲填满之前只会返回 EAGAIN,
+  // 首帧往往要等好几个包才出来。EAGAIN 不是错误, 但也不能无限等 —— 一帧都
+  // 没出过且连续这么多次仍无输出, 才判定为真失败交上层回退。
+  static const int MAX_EAGAIN_WITHOUT_FRAME = 60;
 
   AVCodecContext *c_ = NULL;
   AVBufferRef *hw_device_ctx_ = NULL;
@@ -67,6 +71,9 @@ public:
   AVCodecParserContext *parser_ = NULL;
   // 参数集/尺寸还没凑齐的包数, 超过上限就放弃, 交上层回退软解。
   int defer_count_ = 0;
+  // 累计出过的帧数 / 连续 EAGAIN 次数, 用于区分"还没喂够"与"真失败" (见 do_decode)。
+  int decoded_total_ = 0;
+  int again_count_ = 0;
 
 #ifdef CFG_PKG_TRACE
   int in_ = 0;
@@ -121,6 +128,8 @@ public:
     got_pps_ = false;
     extradata_.clear();
     defer_count_ = 0;
+    decoded_total_ = 0;
+    again_count_ = 0;
     hwaccel_ = device_type_ != AV_HWDEVICE_TYPE_NONE;
     int ret;
     if (!(codec_ = avcodec_find_decoder_by_name(name_.c_str()))) {
@@ -311,30 +320,35 @@ private:
     int ret;
     AVFrame *tmp_frame = NULL;
     bool decoded = false;
+    bool again = false;
 
     ret = avcodec_send_packet(c_, pkt_);
-    if (ret < 0) {
+    // send 的 EAGAIN 只说明解码器还没消化完上一包, 不是失败 —— 后面的
+    // receive_frame 会把输出取走, 并顺带消化掉缓冲里的包。
+    if (ret < 0 && ret != AVERROR(EAGAIN)) {
       LOG_ERROR(std::string("avcodec_send_packet failed, ret = ") + av_err2str(ret));
       return ret;
     }
     auto start = util::now();
-    while (ret >= 0 && util::elapsed_ms(start) < ENCODE_TIMEOUT_MS) {
+    while (util::elapsed_ms(start) < ENCODE_TIMEOUT_MS) {
       if ((ret = avcodec_receive_frame(c_, frame_)) != 0) {
-        if (ret != AVERROR(EAGAIN)) {
+        if (ret == AVERROR(EAGAIN)) {
+          again = true;
+        } else {
           LOG_ERROR(std::string("avcodec_receive_frame failed, ret = ") + av_err2str(ret));
         }
-        goto _exit;
+        break;
       }
 
       if (hwaccel_) {
         if (!frame_->hw_frames_ctx) {
           LOG_ERROR(std::string("hw_frames_ctx is NULL"));
-          goto _exit;
+          break;
         }
         if ((ret = av_hwframe_transfer_data(sw_frame_, frame_, 0)) < 0) {
           LOG_ERROR(std::string("av_hwframe_transfer_data failed, ret = ") +
                     av_err2str(ret));
-          goto _exit;
+          break;
         }
 
         tmp_frame = sw_frame_;
@@ -356,9 +370,30 @@ private:
                 (AVPixelFormat)tmp_frame->format, tmp_frame->linesize,
                 tmp_frame->data, key_frame);
     }
-  _exit:
     av_packet_unref(pkt_);
-    return decoded ? 0 : -1;
+    if (decoded) {
+      if (decoded_total_ == 0) {
+        // 首帧日志: 真机验证硬解是否真的跑起来, 只看这一条即可。
+        LOG_INFO(std::string("first frame decoded by ") + name_);
+      }
+      decoded_total_++;
+      again_count_ = 0;
+      return 0;
+    }
+    if (again) {
+      // EAGAIN = 输入还没喂够 / 输出尚未就绪, 属于异步硬件解码器的正常状态,
+      // 不是解码失败。mediacodec 尤其明显: 输入缓冲被填满之前每次 receive 都
+      // 返回 EAGAIN, 首帧要等好几个包才出来。以前这里一律返回 -1, 上层会立刻
+      // 判定解码失败并回退软解, 硬解因此永远用不上。
+      // 有界: 一帧都没出过且连续这么多次仍无输出, 才判定为真失败。
+      if (decoded_total_ == 0 && ++again_count_ > MAX_EAGAIN_WITHOUT_FRAME) {
+        LOG_ERROR(std::string("no frame after ") + std::to_string(again_count_) +
+                  " packets, give up: " + name_);
+        return -1;
+      }
+      return 0;
+    }
+    return -1;
   }
 
   bool check_support() {
