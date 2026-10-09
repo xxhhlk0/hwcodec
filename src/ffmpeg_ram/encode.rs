@@ -330,7 +330,7 @@ impl Encoder {
                 let c = EncodeContext {
                     name: codec.name.clone(),
                     mc_name: codec.mc_name.clone(),
-                    ..ctx
+                    ..ctx.clone()
                 };
 
                 match Encoder::new(c) {
