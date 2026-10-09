@@ -119,8 +119,12 @@ bool opt_flag(const std::map<std::string, std::string> &opts, const char *key,
 // 14代之前的核显 (如 UHD 750) 在 1440p 真实运动画面下实测
 //   async_depth=1 -> 89fps (11.2ms/帧)
 //   async_depth=2 -> 116fps (8.6ms/帧, 默认4也是同一水平)
-//   async_depth=2 + low_power=1 -> 154fps (6.5ms/帧) <-- 本分支采用, 见
-//      apply_qsv_low_latency(): 单独开 low_power 反而只有 56fps
+//   async_depth=1 + low_power=1 -> 56fps (单独开 low_power 反而更慢)
+//   async_depth=2 + low_power=1 -> 154fps (6.5ms/帧)  <-- 实测最优组合
+// ⚠️ 但本分支的**默认值仍是 1**: async_depth=2 时首帧不出包, 会被运行时误判成
+//    "硬件编码器不干活" 而降级到 AV1 软编 (见 rustdesk BUILD.md §5 第 7 条)。
+//    想要 154fps 那档, 由 profile 手动下发 async_depth=2 (本文件后置覆盖, 见
+//    apply_qsv_vendor_opts) 或设环境变量 HWCODEC_ASYNC_DEPTH=2 自行验证。
 // 代价是多 1 帧管线延迟, 60fps 下约 16ms, 对远程桌面可以接受。
 // 环境变量覆盖, 便于不重新构建就调整 (改完重启 RustDesk 服务生效)
 static bool hw_env_flag(const char *key, bool fallback) {
