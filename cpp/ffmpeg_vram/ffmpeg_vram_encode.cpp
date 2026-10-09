@@ -10,6 +10,7 @@ extern "C" {
 #include <libavutil/hwcontext_d3d11va.h>
 #endif
 
+#include <chrono>
 #include <memory>
 #include <stdbool.h>
 #include <stdio.h>
@@ -29,6 +30,19 @@ namespace {
 
 void lockContext(void *lock_ctx);
 void unlockContext(void *lock_ctx);
+
+// encode() 的耗时统计辅助 (只用于日志, 无副作用)
+static int64_t elapsed_us(std::chrono::steady_clock::time_point from,
+                          std::chrono::steady_clock::time_point to) {
+  return std::chrono::duration_cast<std::chrono::microseconds>(to - from).count();
+}
+
+static std::string ms_per_frame(int64_t us, int64_t frames) {
+  const double v = frames > 0 ? (double)us / 1000.0 / (double)frames : 0.0;
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%.2f", v);
+  return std::string(buf);
+}
 
 enum class EncoderDriver {
   NVENC,
@@ -127,6 +141,16 @@ public:
   bool enhance_applied_ = false;
   // 是否下发过 qsv 的 low_power/low_delay_brc (avcodec_open2 失败时据此回退重试)
   bool qsv_low_latency_applied_ = false;
+
+  // encode() 每帧耗时拆分: convert = BGRA->NV12 (D3D11 VideoProcessor),
+  // encode = do_encode (send + receive), 每 1000ms 汇总打一行 "vram enc detail:"。
+  // Rust 侧 video enc stats 的 avg_enc 是这两段之和, 分不出来是哪一段慢。
+  int64_t st_convert_us_ = 0;
+  int64_t st_encode_us_ = 0;
+  int64_t st_send_us_ = 0;
+  int64_t st_recv_us_ = 0;
+  int64_t st_frames_ = 0;
+  std::chrono::steady_clock::time_point st_last_ = std::chrono::steady_clock::now();
 
   const int align_ = 0;
   const bool full_range_ = false;
@@ -369,10 +393,46 @@ public:
     ID3D11Texture2D *tex = textures_[ring_pos_];
     ring_pos_ = (ring_pos_ + 1) % frames_.size();
 
+    auto st_t0 = std::chrono::steady_clock::now();
     if (!convert(texture, f, tex))
       return -1;
+    auto st_t1 = std::chrono::steady_clock::now();
+    const int64_t send_before = st_send_us_;
+    int ret = do_encode(callback, obj, ms, f);
+    auto st_t2 = std::chrono::steady_clock::now();
 
-    return do_encode(callback, obj, ms, f);
+    const int64_t convert_us = elapsed_us(st_t0, st_t1);
+    const int64_t encode_us = elapsed_us(st_t1, st_t2);
+    const int64_t send_us = st_send_us_ - send_before;
+    st_convert_us_ += convert_us;
+    st_encode_us_ += encode_us;
+    // receive 段 = do_encode 总耗时 - send_frame 耗时 (EAGAIN 轮询等待也算在这里)
+    st_recv_us_ += encode_us > send_us ? encode_us - send_us : 0;
+    st_frames_++;
+    log_detail();
+    return ret;
+  }
+
+  // 每 1000ms 打一行, 把 convert 与 encode 分开: Rust 侧 avg_enc 是两者之和,
+  // 只有拆开才能判断 VRAM 慢在 BGRA->NV12 还是慢在编码器取包。
+  void log_detail() {
+    const auto st_now = std::chrono::steady_clock::now();
+    if (std::chrono::duration_cast<std::chrono::milliseconds>(st_now - st_last_)
+            .count() < 1000) {
+      return;
+    }
+    LOG_INFO("vram enc detail: frames=" + std::to_string(st_frames_) +
+             ", convert=" + ms_per_frame(st_convert_us_, st_frames_) +
+             "ms, encode=" + ms_per_frame(st_encode_us_, st_frames_) +
+             "ms (send=" + ms_per_frame(st_send_us_, st_frames_) + "ms, recv=" +
+             ms_per_frame(st_recv_us_, st_frames_) + "ms), total=" +
+             ms_per_frame(st_convert_us_ + st_encode_us_, st_frames_) + "ms");
+    st_convert_us_ = 0;
+    st_encode_us_ = 0;
+    st_send_us_ = 0;
+    st_recv_us_ = 0;
+    st_frames_ = 0;
+    st_last_ = st_now;
   }
 
   void destroy() {
@@ -466,10 +526,12 @@ private:
     int ret;
     bool encoded = false;
     f->pts = ms;
+    auto st_send = std::chrono::steady_clock::now();
     if ((ret = avcodec_send_frame(c_, f)) < 0) {
       LOG_ERROR(std::string("avcodec_send_frame failed, ret = ") + av_err2str(ret));
       return ret;
     }
+    st_send_us_ += elapsed_us(st_send, std::chrono::steady_clock::now());
 
     auto start = util::now();
     while (ret >= 0 && util::elapsed_ms(start) < ENCODE_TIMEOUT_MS) {

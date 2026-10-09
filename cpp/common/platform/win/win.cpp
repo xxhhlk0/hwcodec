@@ -398,16 +398,27 @@ bool NativeDevice::Query() {
   return bResult == TRUE;
 }
 
+// Process() 的耗时统计辅助 (只用于日志, 无副作用)
+static int64_t elapsed_us(std::chrono::steady_clock::time_point from,
+                          std::chrono::steady_clock::time_point to) {
+  return std::chrono::duration_cast<std::chrono::microseconds>(to - from).count();
+}
+
+static std::string ms_per_frame(int64_t us, int64_t frames) {
+  const double v = frames > 0 ? (double)us / 1000.0 / (double)frames : 0.0;
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%.2f", v);
+  return std::string(buf);
+}
+
 bool NativeDevice::Process(ID3D11Texture2D *in, ID3D11Texture2D *out, int width,
                            int height,
                            D3D11_VIDEO_PROCESSOR_CONTENT_DESC content_desc,
                            DXGI_COLOR_SPACE_TYPE colorSpace_in,
                            DXGI_COLOR_SPACE_TYPE colorSpace_out,
                            int arraySlice) {
-  D3D11_TEXTURE2D_DESC inDesc = {0};
-  D3D11_TEXTURE2D_DESC outDesc = {0};
-  in->GetDesc(&inDesc);
-  out->GetDesc(&outDesc);
+  // 注: 上游这里还调了 in->GetDesc()/out->GetDesc() 填两个从未被读取的局部变量,
+  // 每次 Process 白跑 2 次驱动的 GetDesc, 已删。
   if (memcmp(&last_content_desc_, &content_desc, sizeof(content_desc)) != 0) {
     if (video_processor_enumerator_) {
       video_processor_enumerator_.Reset();
@@ -420,6 +431,10 @@ bool NativeDevice::Process(ID3D11Texture2D *in, ID3D11Texture2D *out, int width,
     vp_input_texture_.Reset();
     vp_input_slice_ = -1;
     vp_output_views_.clear();
+    // 处理器重建后旧的流状态全部失效, 缓存一并清掉 (否则新处理器会沿用旧取值)
+    last_vp_cs_in_ = (DXGI_COLOR_SPACE_TYPE)-1;
+    last_vp_cs_out_ = (DXGI_COLOR_SPACE_TYPE)-1;
+    last_vp_rect_valid_ = false;
   }
   memcpy(&last_content_desc_, &content_desc, sizeof(content_desc));
 
@@ -439,18 +454,31 @@ bool NativeDevice::Process(ID3D11Texture2D *in, ID3D11Texture2D *out, int width,
   // https://chromium.googlesource.com/chromium/src/media/+/refs/heads/main/gpu/windows/d3d11_video_processor_proxy.cc#138
   // https://chromium.googlesource.com/chromium/src/+/a30440e4cfc7016d4f75a4e108025667e130b78b/media/gpu/windows/dxva_video_decode_accelerator_win.cc
 
-  video_context1_->VideoProcessorSetStreamColorSpace1(video_processor_.Get(), 0,
-                                                      colorSpace_in);
-  video_context1_->VideoProcessorSetOutputColorSpace1(video_processor_.Get(),
-                                                      colorSpace_out);
-
+  // 颜色空间与 rect 只在变更时下发: 每帧重下发会让驱动重新配置整条 CSC 管线,
+  // 是本路径 (VRAM 硬编) 编码耗时远高于 RAM 通道的主要嫌疑。详见 win.h 的注释。
+  auto st_t0 = std::chrono::steady_clock::now();
+  if (last_vp_cs_in_ != colorSpace_in) {
+    video_context1_->VideoProcessorSetStreamColorSpace1(video_processor_.Get(), 0,
+                                                        colorSpace_in);
+    last_vp_cs_in_ = colorSpace_in;
+  }
+  if (last_vp_cs_out_ != colorSpace_out) {
+    video_context1_->VideoProcessorSetOutputColorSpace1(video_processor_.Get(),
+                                                        colorSpace_out);
+    last_vp_cs_out_ = colorSpace_out;
+  }
   RECT rect = {0};
   rect.right = width;
   rect.bottom = height;
-  video_context_->VideoProcessorSetStreamSourceRect(video_processor_.Get(), 0,
-                                                    true, &rect);
-  video_context1_->VideoProcessorSetStreamDestRect(video_processor_.Get(), 0,
-                                                   true, &rect);
+  if (!last_vp_rect_valid_ || memcmp(&last_vp_rect_, &rect, sizeof(rect)) != 0) {
+    video_context_->VideoProcessorSetStreamSourceRect(video_processor_.Get(), 0, true,
+                                                      &rect);
+    video_context1_->VideoProcessorSetStreamDestRect(video_processor_.Get(), 0, true,
+                                                     &rect);
+    last_vp_rect_ = rect;
+    last_vp_rect_valid_ = true;
+  }
+  auto st_t1 = std::chrono::steady_clock::now();
 
   if (!vp_input_view_ || vp_input_texture_.Get() != in ||
       vp_input_slice_ != arraySlice) {
@@ -491,6 +519,7 @@ bool NativeDevice::Process(ID3D11Texture2D *in, ID3D11Texture2D *out, int width,
     }
     vp_output_views_.push_back({out, outputView});
   }
+  auto st_t2 = std::chrono::steady_clock::now();
 
   D3D11_VIDEO_PROCESSOR_STREAM StreamData;
   ZeroMemory(&StreamData, sizeof(StreamData));
@@ -498,6 +527,24 @@ bool NativeDevice::Process(ID3D11Texture2D *in, ID3D11Texture2D *out, int width,
   StreamData.pInputSurface = vp_input_view_.Get();
   HRB(video_context_->VideoProcessorBlt(video_processor_.Get(),
                                         outputView.Get(), 0, 1, &StreamData));
+  auto st_t3 = std::chrono::steady_clock::now();
+
+  st_vp_state_us_ += elapsed_us(st_t0, st_t1);
+  st_vp_view_us_ += elapsed_us(st_t1, st_t2);
+  st_vp_blt_us_ += elapsed_us(st_t2, st_t3);
+  st_vp_frames_++;
+  if (std::chrono::duration_cast<std::chrono::milliseconds>(st_t3 - st_vp_last_)
+          .count() >= 1000) {
+    LOG_INFO("vp detail: frames=" + std::to_string(st_vp_frames_) +
+             ", state=" + ms_per_frame(st_vp_state_us_, st_vp_frames_) +
+             "ms, view=" + ms_per_frame(st_vp_view_us_, st_vp_frames_) +
+             "ms, blt=" + ms_per_frame(st_vp_blt_us_, st_vp_frames_) + "ms");
+    st_vp_state_us_ = 0;
+    st_vp_view_us_ = 0;
+    st_vp_blt_us_ = 0;
+    st_vp_frames_ = 0;
+    st_vp_last_ = st_t3;
+  }
 
   return true;
 }

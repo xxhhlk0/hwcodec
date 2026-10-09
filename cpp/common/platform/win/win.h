@@ -2,6 +2,7 @@
 #define WIN_H
 
 #include <DirectXMath.h>
+#include <chrono>
 #include <d3d11.h>
 #include <d3d11_1.h>
 #include <directxcolors.h>
@@ -84,6 +85,26 @@ public:
   ComPtr<ID3D11VideoProcessorEnumerator> video_processor_enumerator_ = nullptr;
   ComPtr<ID3D11VideoProcessor> video_processor_ = nullptr;
   D3D11_VIDEO_PROCESSOR_CONTENT_DESC last_content_desc_ = {};
+
+  // VideoProcessor 的流状态 (颜色空间 / source+dest rect) 只在"值真的变了"时才下发。
+  // ID3D11VideoContext1::SetStream|OutputColorSpace1 会让驱动重新配置整条 CSC 管线
+  // (Intel 驱动上尤其明显), 而本路径的取值在一次会话内是常量
+  // (bt709_/full_range_ 是 const 成员, rect 由 width/height 决定), 每帧重下发纯属浪费。
+  // 对照: Chromium 的 d3d11_video_processor_proxy 与 Media Foundation 的编码器
+  // 都只在创建 VideoProcessor 时设一次。缓存随 video_processor_ 重建一起失效。
+  DXGI_COLOR_SPACE_TYPE last_vp_cs_in_ = (DXGI_COLOR_SPACE_TYPE)-1;
+  DXGI_COLOR_SPACE_TYPE last_vp_cs_out_ = (DXGI_COLOR_SPACE_TYPE)-1;
+  RECT last_vp_rect_ = {0, 0, 0, 0};
+  bool last_vp_rect_valid_ = false;
+
+  // Process() 每帧耗时拆分 (状态下发 / 视图创建 / Blt), 每 1000ms 汇总打一行
+  // "vp detail:"。用于判定 VRAM 编码慢到底慢在 Blt 本身还是 CPU 侧的下发/同步。
+  int64_t st_vp_state_us_ = 0;
+  int64_t st_vp_view_us_ = 0;
+  int64_t st_vp_blt_us_ = 0;
+  int64_t st_vp_frames_ = 0;
+  std::chrono::steady_clock::time_point st_vp_last_ =
+      std::chrono::steady_clock::now();
 
   // cached video processor views. CreateVideoProcessorInput/OutputView cost
   // measurable driver time per frame (x2 at 60+ fps), while the input texture
