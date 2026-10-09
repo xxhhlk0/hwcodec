@@ -35,6 +35,9 @@ typedef void (*RamDecodeCallback)(const void *obj, int width, int height,
 
 class FFmpegRamDecoder {
 public:
+  // 参数集/尺寸最多等多少个包 (≈1s@30fps); 超了就走软解回退。
+  static const int MAX_DEFER_COUNT = 30;
+
   AVCodecContext *c_ = NULL;
   AVBufferRef *hw_device_ctx_ = NULL;
   AVFrame *sw_frame_ = NULL;
@@ -58,7 +61,12 @@ public:
   bool got_sps_ = false;
   bool got_pps_ = false;
   std::vector<uint8_t> extradata_;
-  int no_parameter_set_count_ = 0;
+  // 跨包复用的 parser: mediacodec 的 configure 尺寸只能从码流里取 (见
+  // probe_dimensions), 而参数集与首个 slice 未必在同一个包里, parser 得留着
+  // 累积状态。
+  AVCodecParserContext *parser_ = NULL;
+  // 参数集/尺寸还没凑齐的包数, 超过上限就放弃, 交上层回退软解。
+  int defer_count_ = 0;
 
 #ifdef CFG_PKG_TRACE
   int in_ = 0;
@@ -86,12 +94,15 @@ public:
       avcodec_free_context(&c_);
     if (hw_device_ctx_)
       av_buffer_unref(&hw_device_ctx_);
+    if (parser_)
+      av_parser_close(parser_);
 
     frame_ = NULL;
     pkt_ = NULL;
     sw_frame_ = NULL;
     c_ = NULL;
     hw_device_ctx_ = NULL;
+    parser_ = NULL;
   }
   int reset() {
     if (name_.find("h264") != std::string::npos) {
@@ -109,7 +120,7 @@ public:
     got_sps_ = false;
     got_pps_ = false;
     extradata_.clear();
-    no_parameter_set_count_ = 0;
+    defer_count_ = 0;
     hwaccel_ = device_type_ != AV_HWDEVICE_TYPE_NONE;
     int ret;
     if (!(codec_ = avcodec_find_decoder_by_name(name_.c_str()))) {
@@ -192,7 +203,10 @@ public:
     }
     if (!opened_) {
       ret = open_with_extradata(data, length);
-      if (ret != 0) {
+      if (ret <= 0) {
+        // 0: 本包还凑不齐参数集/尺寸, 静默等下一包 —— 返回成功且无帧, 免得
+        //    上层把"还没准备好"当成解码失败而回退软解。
+        // -1: 放弃, 交上层回退软解。
         return ret;
       }
     }
@@ -203,41 +217,93 @@ public:
   }
 
 private:
+  // ffmpeg 的 mediacodec wrapper 在 open 时用 avctx->width/height 去 configure
+  // (libavcodec/mediacodecdec.c: ff_AMediaFormat_setInt32(format, "width", ...)),
+  // 给 0 会被 MediaCodec 直接拒掉 —— Qualcomm c2 报
+  // "Failed to configure codec c2.qti.avc.decoder ... width=0, height=0"。
+  // 参数集里没有尺寸字段可读, 但 Android 的 ffmpeg 编了 h264/hevc parser
+  // (portfile.cmake: --enable-parser=h264,hevc), 拿 parser 过一遍码流即可。
+  // 取 coded 尺寸: MediaCodec 的 width/height 描述的是解码缓冲区, 得 >= coded,
+  // 显示尺寸由设备上报的 crop 修正 (mediacodecdec_common.c 读 crop-* 后
+  // ff_set_dimensions); ExoPlayer 同样传 coded 尺寸。
+  bool probe_dimensions(const uint8_t *data, int length) {
+    if (!parser_) {
+      parser_ = av_parser_init(data_format_ == DataFormat::H264
+                                   ? AV_CODEC_ID_H264
+                                   : AV_CODEC_ID_HEVC);
+      if (!parser_) {
+        LOG_ERROR(std::string("av_parser_init failed for ") + name_);
+        return false;
+      }
+    }
+    uint8_t *out = NULL;
+    int out_size = 0;
+    av_parser_parse2(parser_, c_, &out, &out_size, data, length, AV_NOPTS_VALUE,
+                     AV_NOPTS_VALUE, 0);
+    // 再空喂一次 = flush。parser 会缓存数据等下一个 AU 的起始码来定边界
+    // (libavcodec/parser.c: !*buf_size && next==END_NOT_FOUND -> next=0),
+    // 不 flush 就一直不解析。flush 只清缓冲, 参数集状态留着。
+    av_parser_parse2(parser_, c_, &out, &out_size, NULL, 0, AV_NOPTS_VALUE,
+                     AV_NOPTS_VALUE, 0);
+    int w = parser_->coded_width > 0 ? parser_->coded_width : parser_->width;
+    int h = parser_->coded_height > 0 ? parser_->coded_height : parser_->height;
+    if (w <= 0 || h <= 0) {
+      return false;
+    }
+    c_->width = w;
+    c_->height = h;
+    LOG_INFO(std::string("probed frame size ") + std::to_string(w) + "x" +
+             std::to_string(h) + " for " + name_);
+    return true;
+  }
+
   // 用码流里的参数集补上 extradata 再 open (仅延迟 open 的解码器会走到)。
-  // 拿不到参数集时返回 -1 且不置 open_failed_: 参数集可能被拆到后面的包里,
-  // 下一包补齐后再试。open 真失败则置 open_failed_ 不再重试。
+  // 返回值: 1 = 已 open; 0 = 本包不够, 等下一包; -1 = 放弃 (置 open_failed_)。
   int open_with_extradata(const uint8_t *data, int length) {
     if (open_failed_) {
       return -1;
     }
-    if (!util_decode::collect_parameter_sets(data, length, data_format_,
-                                             extradata_, got_vps_, got_sps_,
-                                             got_pps_)) {
-      if (no_parameter_set_count_++ == 0) {
-        LOG_WARN(std::string("no parameter set in packet, wait for the next: ") +
-                 name_);
+    if (util_decode::collect_parameter_sets(data, length, data_format_,
+                                            extradata_, got_vps_, got_sps_,
+                                            got_pps_)) {
+      if (!c_->extradata) {
+        c_->extradata = (uint8_t *)av_mallocz(extradata_.size() +
+                                              AV_INPUT_BUFFER_PADDING_SIZE);
+        if (!c_->extradata) {
+          LOG_ERROR(std::string("av_mallocz extradata failed"));
+          open_failed_ = true;
+          return -1;
+        }
+        memcpy(c_->extradata, extradata_.data(), extradata_.size());
+        c_->extradata_size = (int)extradata_.size();
       }
-      return -1;
+      // mediacodec 还必须在 open 前给出尺寸, 否则 configure 必失败。
+      if (probe_dimensions(data, length)) {
+        int ret = avcodec_open2(c_, codec_, NULL);
+        if (ret < 0) {
+          LOG_ERROR(std::string("avcodec_open2 failed, ret = ") + av_err2str(ret));
+          open_failed_ = true;
+          return -1;
+        }
+        opened_ = true;
+        LOG_INFO(std::string("opened ") + name_ + " with extradata " +
+                 std::to_string(extradata_.size()) + " bytes");
+        return 1;
+      }
     }
-    c_->extradata =
-        (uint8_t *)av_mallocz(extradata_.size() + AV_INPUT_BUFFER_PADDING_SIZE);
-    if (!c_->extradata) {
-      LOG_ERROR(std::string("av_mallocz extradata failed"));
+    if (defer_count_++ == 0) {
+      LOG_WARN(std::string("parameter set or frame size not ready, wait for the "
+                           "next packet: ") +
+               name_);
+    }
+    // 参数集可能被拆到后面的包里, 也可能要等下一个 IDR 才带上; 但也不能无限
+    // 等下去 (否则永远没有帧), 超上限就放弃, 由上层回退软解。
+    if (defer_count_ > MAX_DEFER_COUNT) {
+      LOG_ERROR(std::string("give up waiting for parameter set/frame size: ") +
+                name_);
       open_failed_ = true;
       return -1;
     }
-    memcpy(c_->extradata, extradata_.data(), extradata_.size());
-    c_->extradata_size = (int)extradata_.size();
-
-    int ret = avcodec_open2(c_, codec_, NULL);
-    if (ret < 0) {
-      LOG_ERROR(std::string("avcodec_open2 failed, ret = ") + av_err2str(ret));
-      open_failed_ = true;
-      return -1;
-    }
-    opened_ = true;
-    LOG_INFO(std::string("opened ") + name_ + " with extradata " +
-             std::to_string(extradata_.size()) + " bytes");
     return 0;
   }
 
