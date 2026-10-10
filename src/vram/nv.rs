@@ -17,6 +17,7 @@ pub fn encode_calls() -> EncodeCalls {
         test: nv_test_encode,
         set_bitrate: nv_set_bitrate,
         set_framerate: nv_set_framerate,
+        set_force_keyframe: nv_set_force_keyframe,
     }
 }
 
