@@ -17,6 +17,7 @@ pub fn encode_calls() -> EncodeCalls {
         test: amf_test_encode,
         set_bitrate: amf_set_bitrate,
         set_framerate: amf_set_framerate,
+        set_force_keyframe: amf_set_force_keyframe,
     }
 }
 

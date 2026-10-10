@@ -110,6 +110,16 @@ impl Encoder {
             }
         }
     }
+
+    /// 强制下一帧编码为 IDR (客户端丢帧后请求同步用)。
+    pub fn set_force_keyframe(&mut self) -> Result<(), i32> {
+        unsafe {
+            match (self.calls.set_force_keyframe)(self.codec) {
+                0 => Ok(()),
+                err => Err(err),
+            }
+        }
+    }
 }
 
 impl Drop for Encoder {

@@ -141,6 +141,10 @@ public:
   bool enhance_applied_ = false;
   // 是否下发过 qsv 的 low_power/low_delay_brc (avcodec_open2 失败时据此回退重试)
   bool qsv_low_latency_applied_ = false;
+  // 强制下一帧为 IDR (客户端丢帧后请求同步用, 见 rustdesk video_service.rs
+  // 的 OPTION_REFRESH)。置位后在 do_encode 里给 frame 打
+  // AV_PICTURE_TYPE_I, 一帧后自动清除。
+  bool force_keyframe_ = false;
 
   // encode() 每帧耗时拆分: convert = BGRA->NV12 (D3D11 VideoProcessor),
   // encode = do_encode (send + receive), 每 1000ms 汇总打一行 "vram enc detail:"。
@@ -521,11 +525,24 @@ private:
     }
     return false;
   }
+public:
+  // 置位后下一帧编码为 IDR。客户端丢帧后请求同步用, 比重启编码器轻量得多。
+  void set_force_keyframe() { force_keyframe_ = true; }
+
   int do_encode(EncodeCallback callback, const void *obj, int64_t ms,
                 AVFrame *f) {
     int ret;
     bool encoded = false;
     f->pts = ms;
+    if (force_keyframe_) {
+      // 强制 IDR: pict_type=I 让 ffmpeg 包装层 (nvenc/qsv/amf) 下发
+      // FORCE_IDR。用完即清, 只影响一帧。
+      f->pict_type = AV_PICTURE_TYPE_I;
+      force_keyframe_ = false;
+    } else {
+      // 交给编码器按 GOP 决定 (NONE = 不指定)
+      f->pict_type = AV_PICTURE_TYPE_NONE;
+    }
     auto st_send = std::chrono::steady_clock::now();
     if ((ret = avcodec_send_frame(c_, f)) < 0) {
       LOG_ERROR(std::string("avcodec_send_frame failed, ret = ") + av_err2str(ret));
@@ -718,6 +735,14 @@ int ffmpeg_vram_set_framerate(FFmpegVRamEncoder *encoder, int32_t framerate) {
     return encoder->set_framerate(framerate);
   } catch (const std::exception &e) {
     LOG_ERROR(std::string("ffmpeg_vram_set_framerate failed, ") + std::string(e.what()));
+  }
+  return -1;
+}
+
+int ffmpeg_vram_set_force_keyframe(FFmpegVRamEncoder *encoder) {
+  if (encoder) {
+    encoder->set_force_keyframe();
+    return 0;
   }
   return -1;
 }

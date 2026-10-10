@@ -168,6 +168,16 @@ impl Encoder {
         }
     }
 
+    /// 强制下一帧编码为 IDR (客户端丢帧后请求同步用)。
+    pub fn set_force_keyframe(&mut self) -> Result<(), ()> {
+        let ret = unsafe { ffmpeg_ram_set_force_keyframe(self.codec) };
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+
     pub fn format_from_name(name: String) -> Result<DataFormat, ()> {
         if name.contains("h264") {
             return Ok(H264);

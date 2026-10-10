@@ -17,6 +17,7 @@ pub fn encode_calls() -> EncodeCalls {
         test: mfx_test_encode,
         set_bitrate: mfx_set_bitrate,
         set_framerate: mfx_set_framerate,
+        set_force_keyframe: mfx_set_force_keyframe,
     }
 }
 

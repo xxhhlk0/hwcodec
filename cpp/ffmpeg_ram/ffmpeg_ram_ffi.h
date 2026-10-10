@@ -31,5 +31,7 @@ int ffmpeg_ram_get_linesize_offset_length(int pix_fmt, int width, int height,
                                           int align, int *linesize, int *offset,
                                           int *length);
 int ffmpeg_ram_set_bitrate(void *encoder, int kbs);
+// 强制下一帧编码为 IDR (客户端丢帧后请求同步用)。返回 0 = 已置位。
+int ffmpeg_ram_set_force_keyframe(void *encoder);
 
 #endif // FFMPEG_RAM_FFI_H

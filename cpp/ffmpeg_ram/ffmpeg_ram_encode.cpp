@@ -126,6 +126,10 @@ public:
   // 厂商私有参数串 "key=value;..." (来自 rustdesk 的编码 profile)。
   // 在 init() 里于内建默认之后应用, 保证手动设置的值优先 (见 apply_qsv_vendor_opts)。
   std::string opts_;
+  // 强制下一帧为 IDR (客户端丢帧后请求同步用, 见 rustdesk video_service.rs
+  // 的 OPTION_REFRESH)。置位后在 do_encode 里给 frame 打
+  // AV_PICTURE_TYPE_I, 一帧后自动清除。
+  bool force_keyframe_ = false;
   RamEncodeCallback callback_ = NULL;
   int offset_[AV_NUM_DATA_POINTERS] = {0};
 
@@ -428,10 +432,23 @@ private:
     return err;
   }
 
+public:
+  // 置位后下一帧编码为 IDR。客户端丢帧后请求同步用, 比重启编码器轻量得多。
+  void set_force_keyframe() { force_keyframe_ = true; }
+
   int do_encode(AVFrame *frame, const void *obj, int64_t ms) {
     int ret;
     bool encoded = false;
     frame->pts = ms;
+    if (force_keyframe_) {
+      // 强制 IDR: pict_type=I 让 ffmpeg 包装层 (nvenc/qsv/amf) 下发
+      // FORCE_IDR。用完即清, 只影响一帧。
+      frame->pict_type = AV_PICTURE_TYPE_I;
+      force_keyframe_ = false;
+    } else {
+      // 交给编码器按 GOP 决定 (NONE = 不指定)
+      frame->pict_type = AV_PICTURE_TYPE_NONE;
+    }
     if ((ret = avcodec_send_frame(c_, frame)) < 0) {
       LOG_ERROR(std::string("avcodec_send_frame failed, ret = ") + av_err2str(ret));
       return ret;
@@ -565,6 +582,14 @@ extern "C" int ffmpeg_ram_set_bitrate(FFmpegRamEncoder *encoder, int kbs) {
     return encoder->set_bitrate(kbs);
   } catch (const std::exception &e) {
     LOG_ERROR(std::string("ffmpeg_ram_set_bitrate failed, ") + std::string(e.what()));
+  }
+  return -1;
+}
+
+extern "C" int ffmpeg_ram_set_force_keyframe(FFmpegRamEncoder *encoder) {
+  if (encoder) {
+    encoder->set_force_keyframe();
+    return 0;
   }
   return -1;
 }

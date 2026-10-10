@@ -79,6 +79,8 @@ pub struct EncodeCalls {
     pub test: TestEncodeCall,
     pub set_bitrate: IVICall,
     pub set_framerate: IVICall,
+    /// 强制下一帧编码为 IDR (客户端丢帧后请求同步用)
+    pub set_force_keyframe: IVCall,
 }
 pub struct DecodeCalls {
     pub new: NewDecoderCall,

@@ -39,4 +39,8 @@ int mfx_set_bitrate(void *encoder, int32_t kbs);
 
 int mfx_set_framerate(void *encoder, int32_t framerate);
 
+// 强制下一帧编码为 IDR (客户端丢帧后请求同步用)。返回 0 = 已置位。
+// 当前为 no-op (mfx 原生通道暂未实现, 主路径 NVENC via ffmpeg 已支持)。
+int mfx_set_force_keyframe(void *encoder);
+
 #endif // MFX_FFI_H

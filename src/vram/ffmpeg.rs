@@ -17,6 +17,7 @@ pub fn encode_calls() -> EncodeCalls {
         test: ffmpeg_vram_test_encode,
         set_bitrate: ffmpeg_vram_set_bitrate,
         set_framerate: ffmpeg_vram_set_framerate,
+        set_force_keyframe: ffmpeg_vram_set_force_keyframe,
     }
 }
 

@@ -763,4 +763,11 @@ int amf_set_framerate(void *encoder, int32_t framerate) {
   return -1;
 }
 
+// 强制下一帧编码为 IDR。当前 no-op (amf 原生通道暂未实现)。
+// 主路径 NVENC via ffmpeg 的 ffmpeg_vram_set_force_keyframe 已支持。
+int amf_set_force_keyframe(void *encoder) {
+  (void)encoder;
+  return 0;
+}
+
 } // extern "C"
