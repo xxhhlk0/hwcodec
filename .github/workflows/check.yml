@@ -1,0 +1,14 @@
+name: check
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  struct-init:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify struct initializers cover declared fields
+        run: python3 dev/check_struct_init.py
