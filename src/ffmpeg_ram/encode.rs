@@ -6,7 +6,8 @@ use crate::{
     ffmpeg::{init_av_log, AVPixelFormat},
     ffmpeg_ram::{
         ffmpeg_linesize_offset_length, ffmpeg_ram_encode, ffmpeg_ram_free_encoder,
-        ffmpeg_ram_new_encoder, ffmpeg_ram_set_bitrate, CodecInfo, AV_NUM_DATA_POINTERS,
+        ffmpeg_ram_new_encoder, ffmpeg_ram_set_bitrate, ffmpeg_ram_set_force_keyframe, CodecInfo,
+        AV_NUM_DATA_POINTERS,
     },
 };
 use log::trace;
