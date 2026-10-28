@@ -143,7 +143,7 @@ public:
   bool qsv_low_latency_applied_ = false;
   // 强制下一帧为 IDR (客户端丢帧后请求同步用, 见 rustdesk video_service.rs
   // 的 OPTION_REFRESH)。置位后在 do_encode 里给 frame 打
-  // AV_PICTURE_TYPE_I, 一帧后自动清除。
+  // AV_PICTURE_TYPE_I + AV_FRAME_FLAG_KEY, 一帧后自动清除。
   bool force_keyframe_ = false;
 
   // encode() 每帧耗时拆分: convert = BGRA->NV12 (D3D11 VideoProcessor),
@@ -535,13 +535,14 @@ public:
     bool encoded = false;
     f->pts = ms;
     if (force_keyframe_) {
-      // 强制 IDR: pict_type=I 让 ffmpeg 包装层 (nvenc/qsv/amf) 下发
-      // FORCE_IDR。用完即清, 只影响一帧。
+      // QSV requires KEY as well as pict_type=I to request an IDR.
       f->pict_type = AV_PICTURE_TYPE_I;
+      f->flags |= AV_FRAME_FLAG_KEY;
       force_keyframe_ = false;
     } else {
-      // 交给编码器按 GOP 决定 (NONE = 不指定)
+      // Reused surfaces must not keep the preceding IDR request.
       f->pict_type = AV_PICTURE_TYPE_NONE;
+      f->flags &= ~AV_FRAME_FLAG_KEY;
     }
     auto st_send = std::chrono::steady_clock::now();
     if ((ret = avcodec_send_frame(c_, f)) < 0) {
