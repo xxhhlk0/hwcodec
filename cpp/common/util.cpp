@@ -625,6 +625,16 @@ bool set_others(void *priv_data, const std::string &name) {
       return false;
     }
   }
+  // nvenc: do_encode 给 frame 打 pict_type=I 强制关键帧时, 默认走 FORCEINTRA
+  // (普通 I 帧, 输出包不带 AV_PKT_FLAG_KEY), 上层 (rustdesk video_service) 等
+  // 不到 key=1 就会在 2s 后重建编码器, 每 ~2.5s 一次形成风暴 (周期性卡顿)。
+  // forced-idr=1 让强制关键帧走 FORCEIDR (真 IDR, 包带 KEY 标志)。
+  // 只影响"强制"路径; gop 到期的自然 IDR 不受影响。旧 FFmpeg 无该选项时只记日志。
+  if (name.find("nvenc") != std::string::npos) {
+    if ((ret = av_opt_set_int(priv_data, "forced-idr", 1, 0)) < 0) {
+      LOG_WARN(std::string("nvenc set forced-idr failed, ret = ") + av_err2str(ret));
+    }
+  }
   return true;
 }
 
